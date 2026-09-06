@@ -1,4 +1,7 @@
 /target/
 /.tools/
 /dist/
+/scripts/
+/examples/
+/docs/
 *.pdb
