@@ -1,0 +1,17 @@
+[package]
+name = "mdlite"
+version = "0.1.0"
+edition = "2021"
+description = "A dependency-free native Win32 Markdown reader"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.small]
+inherits = "release"
+opt-level = "z"

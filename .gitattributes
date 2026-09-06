@@ -1,0 +1,12 @@
+# Text files are stored with LF and checked out as the platform prefers.
+* text=auto
+
+*.rs      text diff=rust
+*.md      text
+*.toml    text
+*.ini     text
+# PowerShell is only ever run on Windows; keep CRLF so editors there behave.
+*.ps1     text eol=crlf
+
+*.ico     binary
+*.png     binary
