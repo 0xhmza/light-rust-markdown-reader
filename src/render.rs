@@ -46,10 +46,10 @@ impl Pipe {
     /// gets no warning: nothing renders worse under it.
     pub fn note(pinned: Option<Pipe>) -> &'static str {
         match pinned {
-            None => "Each block is drawn by the cheapest pipeline that can draw it correctly, and colour glyphs are drawn in place, so one emoji never moves a whole paragraph.",
-            Some(Pipe::Gdi) => "Sharpest and cheapest for Latin text. Greek, Cyrillic and CJK give up the smoother fallback of GDI+, and blocks that need shaping still use Direct2D.",
-            Some(Pipe::GdiPlus) => "Smoother glyph fallback everywhere, for a little more work per line. Blocks that need shaping or bidirectional ordering still use Direct2D.",
-            Some(Pipe::D2d) => "Everything is shaped by DirectWrite. Nothing renders worse this way, but plain Latin text costs more than it needs to.",
+            None => "Chooses a renderer for each block. Complex scripts and colour emoji remain fully supported.",
+            Some(Pipe::Gdi) => "Fast Latin text. Other alphabets may look less smooth; complex scripts still use Direct2D.",
+            Some(Pipe::GdiPlus) => "Smoother font fallback with a little more processing. Complex scripts still use Direct2D.",
+            Some(Pipe::D2d) => "Uses DirectWrite for every block. Full text shaping, with more processing for simple documents.",
         }
     }
     /// What in `text` drives the choice, as SHAPING/COLOR/NON_LATIN flags. The

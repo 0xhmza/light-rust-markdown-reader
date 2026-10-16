@@ -149,6 +149,9 @@ impl Themes {
             .take(32)
             .collect();
         let name = name.trim();
+        if name.eq_ignore_ascii_case("viewer") {
+            return self.add("", from);
+        }
         if name.is_empty() {
             let mut n = 2;
             while self.find(&format!("Custom {n}")).is_some() {
@@ -375,6 +378,13 @@ Floating=Yes"
         assert_eq!(Themes::parse("[viewer]\nzoom=99999").zoom, Themes::ZOOM.1);
         assert_eq!(Themes::parse("[viewer]\nzoom=big").zoom, 100);
     }
+    #[test]
+    fn custom_palette_cannot_replace_the_viewer_section() {
+        let mut themes = Themes::default();
+        let index = themes.add("Viewer", Palette::light());
+        assert_eq!(themes.palettes[index].0, "Custom");
+    }
+
     #[test]
     fn invalid_values_keep_defaults() {
         let t = Themes::parse(

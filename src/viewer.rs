@@ -46,11 +46,28 @@ const SMOOTH: usize = 321;
 const NAME: usize = 322;
 const FLOAT: usize = 324;
 const ADD: usize = 323;
-/// The animation timer, and the tick it asks Windows for.
-const GLIDE: usize = 1;
-const FRAME: u32 = 8;
+const DEFAULT_READER: usize = 325;
+const TEXT_SIZE: usize = 326;
+const DEFAULT_STATUS: usize = 327;
+/// How quickly a smooth scroll closes the distance, as the time constant of an
+/// exponential ease-out. The view covers 63% of what is left in this long and is
+/// within a pixel of a 300 px scroll after about a third of a second.
+const EASE: f64 = 0.045;
+/// The fastest a scroll may travel, in screens per second. Past about a hundred
+/// pixels a frame the eye stops following the text and sees a smear, which is
+/// what an uncapped ease-out does at the start of a long jump.
+const SPEED: f64 = 5.0;
+/// A scroll further than this many screens is not worth watching.
+const FAR: i32 = 4;
 /// One owner-drawn swatch per palette role.
 const SWATCH: usize = 330;
+
+/// Carry fractional pixels across fine wheel events, including reversals.
+fn wheel_pixels(delta: i32, amount: i32, remainder: &mut i32) -> i32 {
+    let movement = delta.saturating_mul(amount).saturating_add(*remainder);
+    *remainder = movement % 120;
+    movement / 120
+}
 
 struct Font {
     handle: Handle,
@@ -420,6 +437,12 @@ struct App {
     tallest: i32,
     scroll: i32,
     wheel_remainder: i32,
+    pixel_remainder: i32,
+    /// The exact position a smooth scroll has reached. `scroll` is this, rounded
+    /// to a whole pixel so text always lands on the pixel grid.
+    pos: f64,
+    last_frame: Instant,
+    animating: bool,
     /// Grab offset inside the scrollbar thumb while dragging it.
     grab: Option<i32>,
     hover: bool,
@@ -435,9 +458,7 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let theme_path = std::env::current_exe()
-            .unwrap_or_default()
-            .with_file_name("mdlite.ini");
+        let theme_path = crate::config::path();
         let themes = Themes::load(&theme_path);
         Self {
             theme: themes.start,
@@ -469,6 +490,10 @@ impl App {
             tallest: 0,
             scroll: 0,
             wheel_remainder: 0,
+            pixel_remainder: 0,
+            pos: 0.0,
+            last_frame: Instant::now(),
+            animating: false,
             grab: None,
             hover: false,
             buffer: None,
@@ -587,6 +612,9 @@ impl App {
         self.stats.micros = started.elapsed().as_micros();
         self.scroll = 0;
         self.wheel_remainder = 0;
+        self.pixel_remainder = 0;
+        self.target = 0;
+        self.animating = false;
     }
     /// Turn spans into a piece, choosing its pipeline and sharing storage and
     /// measurements with identical text elsewhere in the document.
@@ -884,6 +912,9 @@ impl App {
         ReleaseDC(hwnd, dc);
         self.update_scroll(hwnd);
         self.place_floater();
+        // The buffer holds the picture of the old layout, and a scroll moves
+        // what it holds. Dropping it makes the next paint draw the new layout whole.
+        self.buffer = None;
         InvalidateRect(hwnd, ptr::null(), 0);
     }
 
@@ -1218,37 +1249,52 @@ impl App {
     unsafe fn scroll_to(&mut self, hwnd: Hwnd, target: i32) {
         self.shift(hwnd, target);
         self.target = self.scroll;
+        self.animating = false;
     }
-    /// Move the view over the next few frames, easing towards `target`. A
-    /// second request while one is running simply moves the destination.
+    /// Ease the view towards `target`. A second request while one is running
+    /// simply moves the destination, so a spun wheel keeps accelerating.
     unsafe fn glide_to(&mut self, hwnd: Hwnd, target: i32) {
         let target = target.clamp(0, (self.content_height - self.height).max(0));
-        if !self.smooth || target == self.scroll {
+        let far = (target - self.scroll).abs() > self.height.saturating_mul(FAR);
+        if !self.smooth || target == self.scroll || far {
             return self.scroll_to(hwnd, target);
         }
-        if self.target == self.scroll {
-            frame_clock(true);
-            SetTimer(hwnd, GLIDE, FRAME, ptr::null());
+        if !self.animating {
+            self.animating = true;
+            self.pos = self.scroll as f64;
+            // Start a nominal frame in, so the first notch answers at once
+            // instead of after the next refresh.
+            self.last_frame = Instant::now() - std::time::Duration::from_millis(8);
         }
         self.target = target;
     }
-    /// One animation frame: close a quarter of the remaining distance, which
-    /// settles in about a fifth of a second however far the jump was.
+    /// One animation frame, driven by the message loop once per display refresh.
+    /// The step follows the clock rather than the frame count, so a late frame
+    /// covers more ground and the motion keeps its speed.
     unsafe fn glide(&mut self, hwnd: Hwnd) {
-        self.target = self
-            .target
-            .clamp(0, (self.content_height - self.height).max(0));
-        let remaining = self.target - self.scroll;
-        let step = if remaining.abs() < 8 {
-            remaining
+        let farthest = (self.content_height - self.height).max(0);
+        self.target = self.target.clamp(0, farthest);
+        // Something else moved the view meanwhile (a reload, a zoom): carry on from there.
+        if self.pos.round() as i32 != self.scroll {
+            self.pos = self.scroll as f64;
+        }
+        let now = Instant::now();
+        let elapsed = now
+            .duration_since(self.last_frame)
+            .as_secs_f64()
+            .clamp(0.001, 0.1);
+        self.last_frame = now;
+        let remaining = self.target as f64 - self.pos;
+        self.pos = if remaining.abs() < 0.5 {
+            self.target as f64
         } else {
-            remaining / 4
+            let reach = SPEED * self.height.max(1) as f64 * elapsed;
+            let step = remaining * (1.0 - (-elapsed / EASE).exp());
+            self.pos + step.clamp(-reach, reach)
         };
-        self.shift(hwnd, self.scroll + step);
-        if self.scroll == self.target || step == 0 {
-            self.target = self.scroll;
-            KillTimer(hwnd, GLIDE);
-            frame_clock(false);
+        self.shift(hwnd, self.pos.round() as i32);
+        if self.scroll == self.target {
+            self.animating = false;
         }
     }
     unsafe fn shift(&mut self, hwnd: Hwnd, target: i32) {
@@ -1256,7 +1302,6 @@ impl App {
         if target == self.scroll {
             return;
         }
-        let thumb = self.thumb();
         let delta = self.scroll - target;
         self.scroll = target;
         // Only the position moves here. Touching the range would ask Windows
@@ -1264,36 +1309,95 @@ impl App {
         let mut info = ScrollInfo::new(4);
         info.pos = self.scroll;
         SetScrollInfo(hwnd, 1, &info, 0);
-        // Copy existing pixels and invalidate only the newly exposed strip.
-        if delta.abs() < self.height {
-            let text = Rect {
-                left: 0,
-                top: 0,
-                right: self.bar().1,
-                bottom: self.height,
-            };
-            ScrollWindowEx(hwnd, 0, delta, &text, &text, NULL, ptr::null_mut(), 2);
-            self.invalidate_bar(hwnd, thumb);
-        } else {
+        self.present(hwnd, delta);
+    }
+    /// Show the view at its new place without ever showing a half-painted one.
+    /// The pixels that stay are moved inside the back buffer, only the strip
+    /// that scrolls into view is drawn, and the whole frame reaches the window in
+    /// one blit. Scrolling the window itself and painting the strip later would
+    /// let the compositor show the moved text with a stale strip beside it.
+    unsafe fn present(&self, hwnd: Hwnd, delta: i32) {
+        let Some(buffer) = self.buffer.as_ref().filter(|buffer| {
+            (buffer.width, buffer.height) == (self.width, self.height + self.status())
+        }) else {
+            // No frame exists to move yet; the next paint builds the whole of it.
             InvalidateRect(hwnd, ptr::null(), 0);
+            return;
+        };
+        let view = Rect {
+            left: 0,
+            top: 0,
+            right: self.width,
+            bottom: self.height,
+        };
+        let exposed = if delta.abs() >= self.height {
+            view
+        } else {
+            // The scrollbar column does not move with the text: it is redrawn below.
+            BitBlt(
+                buffer.dc,
+                0,
+                delta.max(0),
+                self.bar().1,
+                self.height - delta.abs(),
+                buffer.dc,
+                0,
+                (-delta).max(0),
+                0x00cc0020,
+            );
+            if delta > 0 {
+                Rect {
+                    bottom: delta,
+                    ..view
+                }
+            } else {
+                Rect {
+                    top: self.height + delta,
+                    ..view
+                }
+            }
+        };
+        self.draw(buffer.dc, exposed);
+        self.draw_bar(buffer.dc);
+        let dc = GetDC(hwnd);
+        if !dc.is_null() {
+            BitBlt(
+                dc,
+                0,
+                0,
+                self.width,
+                self.height,
+                buffer.dc,
+                0,
+                0,
+                0x00cc0020,
+            );
+            ReleaseDC(hwnd, dc);
         }
     }
     unsafe fn paint(&mut self, hwnd: Hwnd) {
         let mut paint: PaintStruct = std::mem::zeroed();
         let dc = BeginPaint(hwnd, &mut paint);
         let (width, height) = (self.width, self.height + self.status());
-        if !self
+        let fresh = !self
             .buffer
             .as_ref()
-            .is_some_and(|buffer| (buffer.width, buffer.height) == (width, height))
-        {
+            .is_some_and(|buffer| (buffer.width, buffer.height) == (width, height));
+        if fresh {
             self.buffer = Buffer::new(dc, width.max(1), height.max(1));
         }
         match &self.buffer {
-            // Compose off-screen, then show the frame in one blit.
+            // Compose off-screen, then show the frame in one blit. The buffer
+            // is also what a scroll moves, so a new one is drawn whole.
             Some(buffer) => {
                 let clip = paint.rect;
-                self.draw(buffer.dc, clip);
+                let whole = Rect {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                };
+                self.draw(buffer.dc, if fresh { whole } else { clip });
                 BitBlt(
                     dc,
                     clip.left,
@@ -1311,6 +1415,15 @@ impl App {
         EndPaint(hwnd, &paint);
     }
     unsafe fn draw(&self, dc: Hdc, clip: Rect) {
+        // Rows that straddle the edge of `clip` are drawn whole. Without a clip
+        // their text would be blended onto its own pixels, once per frame of a
+        // scroll, and thicken into a smear.
+        let saved = SaveDC(dc);
+        IntersectClipRect(dc, clip.left, clip.top, clip.right, clip.bottom);
+        self.draw_clipped(dc, clip);
+        RestoreDC(dc, saved);
+    }
+    unsafe fn draw_clipped(&self, dc: Hdc, clip: Rect) {
         let palette = self.palette();
         fill(dc, clip, palette.background);
         SetBkMode(dc, 1);
@@ -1713,12 +1826,12 @@ impl App {
         InvalidateRect(hwnd, ptr::null(), 0);
     }
 
-    /// Persist the choices the settings window can change. A read-only folder
-    /// simply keeps the session's choice without storing it.
-    unsafe fn save(&self) {
+    /// Persist every edited palette and report unwritable configuration files.
+    unsafe fn save(&self) -> bool {
+        let mut saved = true;
         let path = wide(&self.theme_path.to_string_lossy());
         let section = wide("viewer");
-        let (name, palette) = &self.themes.palettes[self.theme.min(self.themes.palettes.len() - 1)];
+        let (name, _) = &self.themes.palettes[self.theme.min(self.themes.palettes.len() - 1)];
         for (key, value) in [
             (
                 "renderer",
@@ -1732,30 +1845,33 @@ impl App {
                 if self.floating { "on" } else { "off" }.to_owned(),
             ),
         ] {
-            WritePrivateProfileStringW(
+            saved &= WritePrivateProfileStringW(
                 section.as_ptr(),
                 wide(key).as_ptr(),
                 wide(&value).as_ptr(),
                 path.as_ptr(),
-            );
+            ) != 0;
         }
-        let section = wide(name);
-        for (index, (key, _)) in Palette::ROLES.iter().enumerate() {
-            let color = palette.role(index);
-            // Back to #RRGGBB from the COLORREF byte order.
-            let hex = format!(
-                "#{:02X}{:02X}{:02X}",
-                color & 0xff,
-                (color >> 8) & 0xff,
-                (color >> 16) & 0xff
-            );
-            WritePrivateProfileStringW(
-                section.as_ptr(),
-                wide(key).as_ptr(),
-                wide(&hex).as_ptr(),
-                path.as_ptr(),
-            );
+        for (name, palette) in &self.themes.palettes {
+            let section = wide(name);
+            for (index, (key, _)) in Palette::ROLES.iter().enumerate() {
+                let color = palette.role(index);
+                // Back to #RRGGBB from the COLORREF byte order.
+                let hex = format!(
+                    "#{:02X}{:02X}{:02X}",
+                    color & 0xff,
+                    (color >> 8) & 0xff,
+                    (color >> 16) & 0xff
+                );
+                saved &= WritePrivateProfileStringW(
+                    section.as_ptr(),
+                    wide(key).as_ptr(),
+                    wide(&hex).as_ptr(),
+                    path.as_ptr(),
+                ) != 0;
+            }
         }
+        saved
     }
 }
 
@@ -2043,12 +2159,28 @@ unsafe fn settings(owner: Hwnd, state: &RefCell<App>) {
     app.place_floater();
 }
 
+/// What the Markdown-files box says before and after the button is pressed.
+const DEFAULT_HINT: &str = "Registers MDLite, then opens Windows Settings so you can choose it.";
+const DEFAULT_DONE: &str = "Registered. In Windows Settings, choose MDLite for .md and .markdown.";
+
 /// Build the settings window: an owner-modal popup of plain Win32 controls.
 unsafe fn settings_window(owner: Hwnd, state: &RefCell<App>) -> Hwnd {
+    settings_window_at(owner, state, GetDpiForWindow(owner).max(96) as i32)
+}
+
+/// The settings window at a given DPI. Nothing in it is a fixed rectangle: every
+/// control is sized from the text it carries, measured with the font it will
+/// use, and placed below the one before it. That is what keeps controls from
+/// overlapping, or clipping their words, at any scale.
+unsafe fn settings_window_at(owner: Hwnd, state: &RefCell<App>, dpi: i32) -> Hwnd {
     const STYLE: u32 = 0x8000_0000 | 0x00c0_0000 | 0x0008_0000; // Popup, caption, menu.
     const CHILD: u32 = 0x5000_0000; // WS_CHILD | WS_VISIBLE.
     const RADIO: u32 = 9; // BS_AUTORADIOBUTTON.
-    const FIRST: u32 = 0x0002_0000 | 0x0001_0000; // WS_GROUP | WS_TABSTOP.
+    const CHECK: u32 = 3; // BS_AUTOCHECKBOX.
+    const DROPLIST: u32 = 3 | 0x0020_0000; // CBS_DROPDOWNLIST | WS_VSCROLL.
+    const WRAP: u32 = 0x2000; // BS_MULTILINE: a long label wraps instead of clipping.
+    const GROUP: u32 = 0x0002_0000; // WS_GROUP.
+    const TAB: u32 = 0x0001_0000; // WS_TABSTOP.
     static REGISTERED: std::sync::Once = std::sync::Once::new();
     let class = wide("MDLite.Settings");
     let instance = GetModuleHandleW(ptr::null());
@@ -2061,27 +2193,16 @@ unsafe fn settings_window(owner: Hwnd, state: &RefCell<App>) -> Hwnd {
             size_of::<Handle>() as i32,
         );
     });
-    let dpi = GetDpiForWindow(owner).max(96) as i32;
-    let s = |n: i32| n * dpi / 96;
-    let mut rect = Rect {
-        left: 0,
-        top: 0,
-        right: s(380),
-        bottom: s(470),
-    };
-    AdjustWindowRect(&mut rect, STYLE, 0);
-    let mut frame = Rect::default();
-    GetWindowRect(owner, &mut frame);
-    let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+    let s = |n: i32| (n as i64 * dpi as i64 / 96) as i32;
     let hwnd = CreateWindowExW(
         1, // WS_EX_DLGMODALFRAME.
         class.as_ptr(),
         wide("Settings").as_ptr(),
         STYLE,
-        frame.left + (frame.right - frame.left - width) / 2,
-        frame.top + (frame.bottom - frame.top - height) / 3,
-        width,
-        height,
+        0,
+        0,
+        s(100),
+        s(100),
         owner,
         NULL,
         instance,
@@ -2091,26 +2212,80 @@ unsafe fn settings_window(owner: Hwnd, state: &RefCell<App>) -> Hwnd {
         return NULL;
     }
     SetWindowLongPtrW(hwnd, -21, state as *const RefCell<App> as isize);
-    let font = ui_font(s(12));
-    let control = |class: &str, text: &str, style: u32, (x, y, w, h), id: usize| {
-        let handle = CreateWindowExW(
-            0,
-            wide(class).as_ptr(),
-            wide(text).as_ptr(),
-            CHILD | style,
-            s(x),
-            s(y),
-            s(w),
-            s(h),
-            hwnd,
-            id as Handle,
-            instance,
-            ptr::null_mut(),
-        );
-        SendMessageW(handle, 0x30, font as usize, 1); // WM_SETFONT.
-        handle
+    let font = ui_font(s(13));
+    // Text is measured with the very font the controls will wear.
+    let screen = GetDC(NULL);
+    let previous = SelectObject(screen, font);
+    let mut metric = TextMetric::default();
+    GetTextMetricsW(screen, &mut metric);
+    let line = metric.height;
+    let words = |text: &str, width: i32| {
+        let text = wide(text);
+        let mut rect = Rect {
+            left: 0,
+            top: 0,
+            right: width.max(1),
+            bottom: 0,
+        };
+        // DT_CALCRECT | DT_WORDBREAK: how tall the text is when wrapped to `width`.
+        DrawTextW(screen, text.as_ptr(), -1, &mut rect, 0x400 | 0x10);
+        rect.bottom
     };
-    let (chosen, smooth, floating, theme, names, breakdown) = {
+    let across = |text: &str| {
+        let text = wide(&text.replace('&', ""));
+        let mut size = Size::default();
+        GetTextExtentPoint32W(screen, text.as_ptr(), text.len() as i32 - 1, &mut size);
+        size.cx
+    };
+    let add =
+        |class: &str, text: &str, style: u32, (x, y, w, h): (i32, i32, i32, i32), id: usize| {
+            let handle = CreateWindowExW(
+                0,
+                wide(class).as_ptr(),
+                wide(text).as_ptr(),
+                CHILD | style,
+                x,
+                y,
+                w,
+                h,
+                hwnd,
+                id as Handle,
+                instance,
+                ptr::null_mut(),
+            );
+            SendMessageW(handle, 0x30, font as usize, 1); // WM_SETFONT.
+            handle
+        };
+    // The one rhythm everything follows.
+    let (margin, gap, pad, column) = (s(16), s(10), s(14), s(340));
+    let field = line + s(10); // An edit box, drop-down or check box row.
+    let button = line + s(14); // A push button.
+    let heading = line + s(8); // What a group box's caption takes.
+    let indicator = s(22); // The box or dot in front of a check or radio label.
+    let inner = column - 2 * pad;
+    // A check box or radio button, as tall as its label needs once wrapped.
+    let option = |text: &str, style: u32, x: i32, y: i32, id: usize| {
+        let height = field.max(words(text, inner - indicator) + s(8));
+        add("BUTTON", text, style | WRAP, (x, y, inner, height), id);
+        height
+    };
+    // A caption and the control beside it, both centred on the row.
+    let label_width = ["&Palette", "&New", "&Text size"]
+        .iter()
+        .map(|text| across(text))
+        .max()
+        .unwrap_or(0)
+        + s(10);
+    let caption = |text: &str, x: i32, y: i32| {
+        add(
+            "STATIC",
+            text,
+            0,
+            (x, y + (field - line) / 2, label_width, line),
+            0,
+        );
+    };
+    let (chosen, smooth, floating, theme, names, breakdown, zoom) = {
         let mut app = state.borrow_mut();
         // Remember what to put back if the reader cancels after previewing.
         app.restore = Some((app.themes.clone(), app.theme));
@@ -2125,80 +2300,232 @@ unsafe fn settings_window(owner: Hwnd, state: &RefCell<App>) -> Hwnd {
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>(),
             app.stats.breakdown(app.pinned),
+            app.zoom,
         )
     };
-    control("BUTTON", "Rendering pipeline", 7, (12, 8, 356, 196), 0); // BS_GROUPBOX.
-    let pipes = [(PIPE, "&Automatic — best pipeline per block (recommended)")]
-        .into_iter()
-        .chain(Pipe::ALL.map(|pipe| (PIPE + 1 + pipe as usize, pipe.label())));
-    for (index, (id, label)) in pipes.enumerate() {
-        let style = RADIO | if index == 0 { FIRST } else { 0 };
-        let button = control(
-            "BUTTON",
-            label,
-            style,
-            (26, 30 + 24 * index as i32, 330, 22),
-            id,
-        );
-        let on = chosen.map_or(index == 0, |pipe| index == 1 + pipe as usize);
-        SendMessageW(button, 0xf1, on as usize, 0); // BM_SETCHECK.
-    }
-    // What the choice under the pointer means, and what it costs this
-    // document. Both are refreshed as the selection moves.
-    control("STATIC", Pipe::note(chosen), 0, (26, 128, 330, 46), NOTE);
-    control("STATIC", &breakdown, 0, (26, 176, 330, 18), SPREAD);
-    control("BUTTON", "Colours", 7, (12, 212, 356, 208), 0);
-    control("STATIC", "&Palette:", 0, (26, 238, 56, 20), 0);
-    // CBS_DROPDOWNLIST, tall enough to drop open over the buttons below.
-    let list = control(
+
+    // Left column. Appearance: which palette, a new one, and each colour.
+    let (x, mut y) = (margin, margin);
+    let appearance = add("BUTTON", "Appearance", 7, (x, y, column, 0), 0); // BS_GROUPBOX.
+    let top = y;
+    let (ix, mut y2) = (x + pad, y + heading);
+    caption("&Palette", ix, y2);
+    let list = add(
         "COMBOBOX",
         "",
-        3 | 0x0020_0000 | FIRST,
-        (86, 234, 270, 260),
+        DROPLIST | GROUP | TAB,
+        (ix + label_width, y2, inner - label_width, field + 8 * line),
         CHOICE,
     );
-    control("STATIC", "&New:", 0, (26, 266, 56, 20), 0);
+    y2 += field + gap;
+    caption("&New", ix, y2);
+    let add_width = (across("Add") + s(28)).max(s(70));
     // WS_BORDER | ES_AUTOHSCROLL: a name for a palette of one's own.
-    control(
+    add(
         "EDIT",
         "",
-        0x0080_0000 | 0x0001_0080,
-        (86, 262, 176, 22),
+        0x0080_0000 | 0x80 | TAB,
+        (
+            ix + label_width,
+            y2,
+            inner - label_width - add_width - gap,
+            field,
+        ),
         NAME,
     );
-    control("BUTTON", "&Add", 0x0001_0000, (270, 261, 86, 24), ADD);
+    SendMessageW(GetDlgItem(hwnd, NAME as i32), 0xc5, 32, 0); // EM_SETLIMITTEXT.
+    add(
+        "BUTTON",
+        "&Add",
+        TAB,
+        (ix + inner - add_width, y2, add_width, field),
+        ADD,
+    );
+    y2 += field + gap;
     for name in &names {
         SendMessageW(list, 0x143, 0, wide(name).as_ptr() as isize); // CB_ADDSTRING.
     }
     SendMessageW(list, 0x14e, theme, 0); // CB_SETCURSEL.
+                                         // The seven colours, four down and then the rest, as swatch plus name.
+    let cell = inner / 2;
+    let swatch = (s(28), line + s(6));
+    let name_width = cell - swatch.0 - s(8);
+    let row = Palette::ROLES
+        .iter()
+        .map(|(_, label)| words(label, name_width))
+        .max()
+        .unwrap_or(0)
+        .max(swatch.1)
+        + s(6);
     for (index, (_, label)) in Palette::ROLES.iter().enumerate() {
-        let (column, row) = (index as i32 / 4, index as i32 % 4);
-        let (x, y) = (26 + column * 170, 296 + row * 26);
+        let (column, line_no) = (index as i32 / 4, index as i32 % 4);
+        let (sx, sy) = (ix + column * cell, y2 + line_no * row);
         // BS_OWNERDRAW: the swatch is the colour itself.
-        control(
+        add(
             "BUTTON",
             "",
-            0x0b | 0x0001_0000,
-            (x, y, 26, 20),
+            0x0b | TAB,
+            (sx, sy, swatch.0, swatch.1),
             SWATCH + index,
         );
-        control("STATIC", label, 0, (x + 32, y + 3, 134, 18), 0);
+        let text = words(label, name_width);
+        add(
+            "STATIC",
+            label,
+            0,
+            (
+                sx + swatch.0 + s(8),
+                sy + (swatch.1 - text) / 2,
+                name_width,
+                text,
+            ),
+            0,
+        );
     }
-    let hint = "Click a colour to change it. The page updates live.";
-    control("STATIC", hint, 0, (26, 394, 330, 18), 0);
-    // BS_AUTOCHECKBOX, on the button row so the window stays this tall.
-    let scrolling = control(
+    y2 += 4 * row + s(2);
+    let hint = "Colour changes preview on the page.";
+    let hint_height = words(hint, inner);
+    add("STATIC", hint, 0, (ix, y2, inner, hint_height), 0);
+    y2 += hint_height + pad;
+    SetWindowPos(appearance, NULL, x, top, column, y2 - top, 0x14);
+    y = y2 + gap;
+
+    // Markdown files: registering MDLite so Windows can offer it for .md.
+    let files = add("BUTTON", "Markdown files", 7, (x, y, column, 0), 0);
+    let top = y;
+    y2 = y + heading;
+    add(
         "BUTTON",
-        "&Smooth scrolling",
-        3 | FIRST,
-        (26, 436, 132, 20),
-        SMOOTH,
+        "Set as &default .md reader…",
+        TAB | GROUP,
+        (ix, y2, inner, button),
+        DEFAULT_READER,
     );
-    SendMessageW(scrolling, 0xf1, smooth as usize, 0);
-    let floater = control("BUTTON", "&Zoom control", 3, (164, 436, 116, 20), FLOAT);
-    SendMessageW(floater, 0xf1, floating as usize, 0);
-    control("BUTTON", "OK", 1 | FIRST, (198, 430, 80, 28), OK); // BS_DEFPUSHBUTTON.
-    control("BUTTON", "Cancel", 0x0001_0000, (286, 430, 80, 28), CANCEL);
+    y2 += button + s(8);
+    // Room for whichever of the two sentences is longer.
+    let status = words(DEFAULT_HINT, inner).max(words(DEFAULT_DONE, inner));
+    add(
+        "STATIC",
+        DEFAULT_HINT,
+        0,
+        (ix, y2, inner, status),
+        DEFAULT_STATUS,
+    );
+    y2 += status + pad;
+    SetWindowPos(files, NULL, x, top, column, y2 - top, 0x14);
+    let left_bottom = y2;
+
+    // Right column. Reading comfort: scrolling and text size.
+    let (x, mut y) = (margin + column + gap, margin);
+    let comfort = add("BUTTON", "Reading comfort", 7, (x, y, column, 0), 0);
+    let top = y;
+    let (ix, mut y2) = (x + pad, y + heading);
+    let scrolling = option("&Smooth scrolling", CHECK | GROUP | TAB, ix, y2, SMOOTH);
+    SendMessageW(GetDlgItem(hwnd, SMOOTH as i32), 0xf1, smooth as usize, 0); // BM_SETCHECK.
+    y2 += scrolling + s(4);
+    let zoom_control = option("Show floating &zoom control", CHECK | TAB, ix, y2, FLOAT);
+    SendMessageW(GetDlgItem(hwnd, FLOAT as i32), 0xf1, floating as usize, 0);
+    y2 += zoom_control + s(8);
+    caption("Text &size", ix, y2);
+    let sizes = add(
+        "COMBOBOX",
+        "",
+        DROPLIST | TAB,
+        (ix + label_width, y2, inner - label_width, field + 8 * line),
+        TEXT_SIZE,
+    );
+    for (index, size) in (Themes::ZOOM.0..=Themes::ZOOM.1).enumerate() {
+        SendMessageW(sizes, 0x143, 0, wide(&format!("{size}%")).as_ptr() as isize);
+        if size == zoom {
+            SendMessageW(sizes, 0x14e, index, 0);
+        }
+    }
+    y2 += field + pad;
+    SetWindowPos(comfort, NULL, x, top, column, y2 - top, 0x14);
+    y = y2 + gap;
+
+    // Advanced rendering: the pipeline, what it means, and what it costs here.
+    let rendering = add("BUTTON", "Advanced rendering", 7, (x, y, column, 0), 0);
+    let top = y;
+    y2 = y + heading;
+    let pipes = [(PIPE, "&Automatic (recommended)")]
+        .into_iter()
+        .chain(Pipe::ALL.map(|pipe| (PIPE + 1 + pipe as usize, pipe.label())));
+    for (index, (id, label)) in pipes.enumerate() {
+        let style = RADIO | TAB | if index == 0 { GROUP } else { 0 };
+        let height = option(label, style, ix, y2, id);
+        let on = chosen.map_or(index == 0, |pipe| index == 1 + pipe as usize);
+        SendMessageW(GetDlgItem(hwnd, id as i32), 0xf1, on as usize, 0);
+        y2 += height + s(2);
+    }
+    y2 += s(6);
+    // The note changes with the choice, so it keeps room for the longest one.
+    let note = [None, Some(Pipe::Gdi), Some(Pipe::GdiPlus), Some(Pipe::D2d)]
+        .into_iter()
+        .map(|pipe| words(Pipe::note(pipe), inner))
+        .max()
+        .unwrap_or(0);
+    add("STATIC", Pipe::note(chosen), 0, (ix, y2, inner, note), NOTE);
+    y2 += note + s(6);
+    let sample = "This document: 88888 GDI, 88888 GDI+, 88888 Direct2D blocks.";
+    let spread = words(sample, inner).max(words(&breakdown, inner));
+    add("STATIC", &breakdown, 0, (ix, y2, inner, spread), SPREAD);
+    y2 += spread + pad;
+    SetWindowPos(rendering, NULL, x, top, column, y2 - top, 0x14);
+    let right_bottom = y2;
+
+    // The row of buttons, under whichever column is taller.
+    let y = left_bottom.max(right_bottom) + gap;
+    let width = |text: &str| (across(text) + s(32)).max(s(88));
+    let (save, cancel) = (width("Save"), width("Cancel"));
+    let right = margin + 2 * column + gap;
+    add(
+        "BUTTON",
+        "Save",
+        1 | GROUP | TAB, // BS_DEFPUSHBUTTON.
+        (right - cancel - gap - save, y, save, button),
+        OK,
+    );
+    add(
+        "BUTTON",
+        "Cancel",
+        TAB,
+        (right - cancel, y, cancel, button),
+        CANCEL,
+    );
+    let note = "Cancel discards appearance changes.";
+    let room = right - cancel - gap - save - gap - margin;
+    let height = words(note, room);
+    add(
+        "STATIC",
+        note,
+        0,
+        (margin, y + (button - height) / 2, room, height),
+        0,
+    );
+
+    SelectObject(screen, previous);
+    ReleaseDC(NULL, screen);
+    // Size the window around what was built, and centre it on the viewer.
+    let mut rect = Rect {
+        left: 0,
+        top: 0,
+        right: right + margin,
+        bottom: y + button + margin,
+    };
+    AdjustWindowRectExForDpi(&mut rect, STYLE, 0, 1, dpi as u32);
+    let mut frame = Rect::default();
+    GetWindowRect(owner, &mut frame);
+    let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+    SetWindowPos(
+        hwnd,
+        NULL,
+        frame.left + (frame.right - frame.left - width) / 2,
+        frame.top + (frame.bottom - frame.top - height) / 3,
+        width,
+        height,
+        0x14,
+    );
     // The font outlives the controls that use it and is released with them.
     SetWindowLongPtrW(hwnd, 0, font as isize);
     hwnd
@@ -2234,6 +2561,25 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, wp: usize, lp: isi
     }
     if msg == WM_COMMAND && !state.is_null() {
         let id = wp & 0xffff;
+        if id == DEFAULT_READER {
+            match crate::association::choose_default(hwnd) {
+                Ok(()) => {
+                    SetWindowTextW(
+                        GetDlgItem(hwnd, DEFAULT_STATUS as i32),
+                        wide(DEFAULT_DONE).as_ptr(),
+                    );
+                }
+                Err(error) => {
+                    MessageBoxW(
+                        hwnd,
+                        wide(&error.to_string()).as_ptr(),
+                        wide("Default Markdown reader").as_ptr(),
+                        0x10,
+                    );
+                }
+            }
+            return 0;
+        }
         // A different palette, chosen from the list.
         if id == CHOICE && (wp >> 16) & 0xffff == 1 {
             let chosen = SendMessageW(GetDlgItem(hwnd, CHOICE as i32), 0x147, 0, 0); // CB_GETCURSEL.
@@ -2256,8 +2602,9 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, wp: usize, lp: isi
             let typed = String::from_utf16_lossy(&typed[..length.max(0) as usize]);
             let mut app = (*state).borrow_mut();
             let from = app.palette();
+            let previous_count = app.themes.palettes.len();
             let index = app.themes.add(&typed, from);
-            if index == app.themes.palettes.len() - 1 {
+            if app.themes.palettes.len() > previous_count {
                 let name = wide(&app.themes.palettes[index].0);
                 SendMessageW(list, 0x143, 0, name.as_ptr() as isize); // CB_ADDSTRING.
             }
@@ -2334,7 +2681,21 @@ unsafe extern "system" fn settings_proc(hwnd: Hwnd, msg: u32, wp: usize, lp: isi
             app.pinned = chosen;
             app.smooth = checked(SMOOTH);
             app.floating = checked(FLOAT);
-            app.save();
+            let selected = SendMessageW(GetDlgItem(hwnd, TEXT_SIZE as i32), 0x147, 0, 0);
+            if selected >= 0 {
+                let zoom = Themes::ZOOM.0 + selected as i32;
+                app.set_zoom(GetParent(hwnd), zoom);
+            }
+            if !app.smooth {
+                let target = app.target;
+                app.scroll_to(GetParent(hwnd), target);
+            }
+            if !app.save() {
+                drop(app);
+                MessageBoxW(hwnd,
+                    wide("Your changes apply to this session, but mdlite.ini could not be saved. Move MDLite to a writable folder to keep your preferences.").as_ptr(),
+                    wide("Settings could not be saved").as_ptr(), 0x30);
+            }
         }
         DestroyWindow(hwnd);
         return 0;
@@ -2431,7 +2792,6 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize
             | WM_LBUTTONDOWN
             | WM_LBUTTONUP
             | WM_MOUSEMOVE
-            | WM_TIMER
             | WM_SETCURSOR
             | 0x318
     ) {
@@ -2483,10 +2843,6 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize
                 }
                 None => {}
             }
-            0
-        }
-        WM_TIMER => {
-            app.glide(hwnd);
             0
         }
         WM_MOUSEMOVE => {
@@ -2606,11 +2962,13 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize
             0
         }
         WM_MOUSEWHEEL => {
-            app.wheel_remainder += ((wp >> 16) as u16 as i16) as i32;
-            let steps = app.wheel_remainder / 120;
-            app.wheel_remainder %= 120;
-            // Ctrl and the wheel resize the text, as everywhere else.
+            let delta = ((wp >> 16) as u16 as i16) as i32;
+            // Keep zoom notches separate from pixel-precision scrolling.
             if wp & 8 != 0 {
+                app.pixel_remainder = 0;
+                app.wheel_remainder += delta;
+                let steps = app.wheel_remainder / 120;
+                app.wheel_remainder %= 120;
                 if steps != 0 {
                     let zoom = app.zoom + steps * Themes::ZOOM.2;
                     app.set_zoom(hwnd, zoom);
@@ -2624,8 +2982,18 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, wp: usize, lp: isize
             } else {
                 app.px(24).saturating_mul(lines.min(100) as i32)
             };
-            // Notches during an animation add to where it is already going.
-            let target = app.target.saturating_sub(steps.saturating_mul(amount));
+            app.wheel_remainder = 0;
+            let movement = wheel_pixels(delta, amount, &mut app.pixel_remainder);
+            // Small wheel/trackpad deltas move immediately instead of waiting for a notch.
+            // Reversing the wheel cancels outstanding motion in the other direction.
+            let from = if (movement > 0 && app.target > app.scroll)
+                || (movement < 0 && app.target < app.scroll)
+            {
+                app.scroll
+            } else {
+                app.target
+            };
+            let target = from.saturating_sub(movement);
             app.glide_to(hwnd, target);
             0
         }
@@ -2762,13 +3130,34 @@ pub fn run() {
         ShowWindow(hwnd, 5);
         UpdateWindow(hwnd);
         let mut message = Msg::default();
-        loop {
-            let result = GetMessageW(&mut message, NULL, 0, 0);
-            if result <= 0 {
-                break;
+        'frames: loop {
+            let animating = state.borrow().animating;
+            if animating {
+                // A scroll is moving: answer whatever is waiting, draw one frame,
+                // then sleep until the screen can show it. Idle windows never
+                // get here, so they cost nothing.
+                while PeekMessageW(&mut message, NULL, 0, 0, 1) != 0 {
+                    if message.message == WM_QUIT {
+                        break 'frames;
+                    }
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                if let Ok(mut app) = state.try_borrow_mut() {
+                    if app.animating {
+                        app.glide(hwnd);
+                    }
+                }
+                if !wait_for_refresh() {
+                    Sleep(8);
+                }
+            } else {
+                if GetMessageW(&mut message, NULL, 0, 0) <= 0 {
+                    break;
+                }
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
             }
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
         }
         // Remember the palette, pipeline and text size for next time.
         state.borrow().save();
@@ -2862,6 +3251,194 @@ mod tests {
             }
         }
     }
+    /// One child of a window: its handle, id, class, style, rectangle in the
+    /// parent's client pixels, and text.
+    struct Control {
+        handle: Hwnd,
+        id: usize,
+        class: String,
+        style: u32,
+        rect: Rect,
+        text: String,
+    }
+    impl Control {
+        fn is_group(&self) -> bool {
+            self.class == "Button" && self.style & 0xf == 7
+        }
+    }
+    unsafe fn controls(hwnd: Hwnd) -> Vec<Control> {
+        let mut found = vec![];
+        let mut child = GetWindow(hwnd, 5); // GW_CHILD.
+        while !child.is_null() {
+            let mut class = [0u16; 32];
+            let length = GetClassNameW(child, class.as_mut_ptr(), 32).max(0) as usize;
+            let mut text = vec![0u16; 512];
+            let count = GetWindowTextW(child, text.as_mut_ptr(), 512).max(0) as usize;
+            let mut rect = Rect::default();
+            GetWindowRect(child, &mut rect);
+            let mut corner = Point {
+                x: rect.left,
+                y: rect.top,
+            };
+            ScreenToClient(hwnd, &mut corner);
+            found.push(Control {
+                handle: child,
+                id: GetWindowLongPtrW(child, -12) as usize, // GWL_ID.
+                class: String::from_utf16_lossy(&class[..length]),
+                style: GetWindowLongPtrW(child, -16) as u32, // GWL_STYLE.
+                rect: Rect {
+                    left: corner.x,
+                    top: corner.y,
+                    right: corner.x + rect.right - rect.left,
+                    bottom: corner.y + rect.bottom - rect.top,
+                },
+                text: String::from_utf16_lossy(&text[..count]),
+            });
+            child = GetWindow(child, 2); // GW_HWNDNEXT.
+        }
+        found
+    }
+    #[test]
+    fn the_settings_window_never_overlaps_or_clips_at_any_scale() {
+        unsafe {
+            let disjoint = |a: &Rect, b: &Rect| {
+                a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top
+            };
+            for dpi in [96, 120, 144, 168, 192, 288] {
+                let owner = window(900, 700);
+                let state = RefCell::new(App::new());
+                let hwnd = settings_window_at(owner, &state, dpi);
+                assert!(!hwnd.is_null());
+                let mut client = Rect::default();
+                GetClientRect(hwnd, &mut client);
+                let all = controls(hwnd);
+                assert!(all.len() >= 38, "{} controls at {dpi} dpi", all.len());
+                let screen = GetDC(NULL);
+                for (index, control) in all.iter().enumerate() {
+                    let rect = &control.rect;
+                    let name = format!("control {} {:?} at {dpi} dpi", control.id, control.text);
+                    assert!(
+                        rect.left >= 0
+                            && rect.top >= 0
+                            && rect.right <= client.right
+                            && rect.bottom <= client.bottom,
+                        "{name} leaves the window"
+                    );
+                    for other in &all[index + 1..] {
+                        // A group box surrounds its controls; everything else keeps to itself.
+                        assert!(
+                            control.is_group() != other.is_group() || disjoint(rect, &other.rect),
+                            "{name} overlaps control {} {:?}",
+                            other.id,
+                            other.text
+                        );
+                    }
+                    // Words that do not fit their control are clipped: measure them
+                    // with the control's own font and require that they fit.
+                    if control.text.is_empty() || control.is_group() {
+                        continue;
+                    }
+                    let font = SendMessageW(control.handle, 0x31, 0, 0) as Handle; // WM_GETFONT.
+                    let old = SelectObject(screen, font);
+                    // The box or dot in front of a check or radio label.
+                    let indicator =
+                        if control.class == "Button" && matches!(control.style & 0xf, 2..=6 | 9) {
+                            22 * dpi / 96
+                        } else {
+                            0
+                        };
+                    let text = wide(&control.text.replace('&', ""));
+                    let mut need = Rect {
+                        left: 0,
+                        top: 0,
+                        right: (rect.right - rect.left - indicator).max(1),
+                        bottom: 0,
+                    };
+                    // DT_CALCRECT | DT_WORDBREAK.
+                    DrawTextW(screen, text.as_ptr(), -1, &mut need, 0x400 | 0x10);
+                    SelectObject(screen, old);
+                    assert!(
+                        need.bottom <= rect.bottom - rect.top,
+                        "{name} needs {} px of height and has {}",
+                        need.bottom,
+                        rect.bottom - rect.top
+                    );
+                }
+                ReleaseDC(NULL, screen);
+                // Everything but the closing row lives inside a group box.
+                let groups: Vec<&Rect> = all
+                    .iter()
+                    .filter(|c| c.is_group())
+                    .map(|c| &c.rect)
+                    .collect();
+                assert_eq!(groups.len(), 4);
+                for control in all.iter().filter(|c| {
+                    !c.is_group()
+                        && !matches!(c.id, OK | CANCEL)
+                        && !c.text.starts_with("Cancel discards")
+                }) {
+                    let r = &control.rect;
+                    assert!(
+                        groups.iter().any(|g| r.left >= g.left
+                            && r.right <= g.right
+                            && r.top >= g.top
+                            && r.bottom <= g.bottom),
+                        "control {} {:?} sits outside every group box at {dpi} dpi",
+                        control.id,
+                        control.text
+                    );
+                }
+                DestroyWindow(hwnd);
+                DestroyWindow(owner);
+            }
+        }
+    }
+    #[test]
+    fn adding_an_existing_palette_does_not_duplicate_it() {
+        unsafe {
+            let owner = window(900, 700);
+            let state = RefCell::new(App::new());
+            let hwnd = settings_window(owner, &state);
+            let list = GetDlgItem(hwnd, CHOICE as i32);
+            let count = SendMessageW(list, 0x146, 0, 0); // CB_GETCOUNT.
+            let last = state.borrow().themes.palettes.last().unwrap().0.clone();
+            SetWindowTextW(GetDlgItem(hwnd, NAME as i32), wide(&last).as_ptr());
+            SendMessageW(hwnd, WM_COMMAND, ADD, 0);
+            assert_eq!(SendMessageW(list, 0x146, 0, 0), count);
+            DestroyWindow(hwnd);
+            DestroyWindow(owner);
+        }
+    }
+
+    #[test]
+    fn settings_save_reading_preferences_and_all_edited_palettes() {
+        unsafe {
+            let owner = window(900, 700);
+            let state = RefCell::new(App::new());
+            let path = std::env::temp_dir().join("mdlite-settings-controls-test.ini");
+            state.borrow_mut().theme_path = path.clone();
+            let hwnd = settings_window(owner, &state);
+            SendMessageW(GetDlgItem(hwnd, SMOOTH as i32), 0xf1, 0, 0);
+            SendMessageW(GetDlgItem(hwnd, FLOAT as i32), 0xf1, 0, 0);
+            SendMessageW(
+                GetDlgItem(hwnd, TEXT_SIZE as i32),
+                0x14e,
+                125 - Themes::ZOOM.0 as usize,
+                0,
+            );
+            state.borrow_mut().themes.palettes[0].1.accent = 0x123456;
+            state.borrow_mut().themes.palettes[1].1.accent = 0x654321;
+            SendMessageW(hwnd, WM_COMMAND, OK, 0);
+            let saved = Themes::load(&path);
+            assert!(!saved.smooth && !saved.floating);
+            assert_eq!(saved.zoom, 125);
+            assert_eq!(saved.palettes[0].1.accent, 0x123456);
+            assert_eq!(saved.palettes[1].1.accent, 0x654321);
+            std::fs::remove_file(path).unwrap();
+            DestroyWindow(owner);
+        }
+    }
+
     /// Build the settings window off-screen, check its controls, and save a
     /// picture of it next to the document previews.
     #[test]
@@ -3713,22 +4290,33 @@ mod tests {
         }
     }
     #[test]
+    fn fine_wheel_input_preserves_distance_and_reverses_without_drift() {
+        let mut remainder = 0;
+        assert_eq!(wheel_pixels(30, 72, &mut remainder), 18);
+        let forward: i32 = (0..120).map(|_| wheel_pixels(1, 73, &mut remainder)).sum();
+        assert_eq!(forward, 73);
+        assert_eq!(remainder, 0);
+        let backward: i32 = (0..120).map(|_| wheel_pixels(-1, 73, &mut remainder)).sum();
+        assert_eq!(forward + backward, 0);
+        assert_eq!(remainder, 0);
+        assert_eq!(wheel_pixels(120, 0, &mut remainder), 0);
+    }
+
+    #[test]
     fn smooth_scrolling_eases_to_its_target_and_then_stops() {
         unsafe {
             let hwnd = window(700, 400);
             let mut app = App::new();
-            document(
-                &mut app,
-                &"A line of text.
-
-"
-                .repeat(400),
-            );
+            document(&mut app, &"A line of text.\n\n".repeat(400));
             app.layout(hwnd);
+            let frame = |app: &mut App| {
+                app.last_frame = Instant::now() - std::time::Duration::from_millis(8);
+                app.glide(hwnd);
+            };
             let settle = |app: &mut App| {
                 let mut frames = 0;
-                while app.target != app.scroll && frames < 500 {
-                    app.glide(hwnd);
+                while app.animating && frames < 500 {
+                    frame(app);
                     frames += 1;
                 }
                 frames
@@ -3737,6 +4325,7 @@ mod tests {
             app.smooth = false;
             app.glide_to(hwnd, 500);
             assert_eq!((app.scroll, app.target), (500, 500));
+            assert!(!app.animating);
 
             // Switched on, it takes frames, always towards the target and never past it.
             app.smooth = true;
@@ -3744,35 +4333,161 @@ mod tests {
             app.glide_to(hwnd, 500);
             assert_eq!(app.scroll, 0, "no frame has run yet");
             assert_eq!(app.target, 500);
-            let mut previous = -1;
+            assert!(app.animating);
+            let mut previous = 0;
             let mut frames = 0;
-            while app.target != app.scroll && frames < 500 {
-                app.glide(hwnd);
-                assert!(app.scroll > previous && app.scroll <= 500);
+            while app.animating && frames < 500 {
+                frame(&mut app);
+                assert!(app.scroll >= previous && app.scroll <= 500);
+                // However far it has to go, the view never outruns the eye.
+                let most = (SPEED * app.height as f64 * 0.0085).ceil() as i32 + 1;
+                assert!(
+                    app.scroll - previous <= most,
+                    "a frame moved {}",
+                    app.scroll - previous
+                );
                 previous = app.scroll;
                 frames += 1;
             }
             assert_eq!(app.scroll, 500);
             assert!(
-                (4..60).contains(&frames),
-                "{frames} frames is not a fifth of a second"
+                (4..90).contains(&frames),
+                "{frames} frames is not about half a second"
             );
 
             // A second request during a glide only moves the destination.
             app.glide_to(hwnd, 1000);
-            app.glide(hwnd);
+            frame(&mut app);
             app.glide_to(hwnd, 100);
             assert_eq!(app.target, 100);
             settle(&mut app);
             assert_eq!(app.scroll, 100);
 
-            // And the document's own limits still win.
-            app.glide_to(hwnd, i32::MAX);
+            // The same distance takes the same time however late a frame is:
+            // the step follows the clock, not the number of frames.
+            app.scroll_to(hwnd, 0);
+            app.glide_to(hwnd, 300);
+            app.last_frame = Instant::now() - std::time::Duration::from_millis(100);
+            app.glide(hwnd);
+            let late = app.scroll;
+            app.scroll_to(hwnd, 0);
+            app.glide_to(hwnd, 300);
+            frame(&mut app);
+            assert!(
+                late > app.scroll * 3,
+                "a 100 ms frame covered {late}, an 8 ms one {}",
+                app.scroll
+            );
             settle(&mut app);
+
+            // Something else moving the view, a reload say, is carried on from.
+            app.scroll_to(hwnd, 0);
+            app.glide_to(hwnd, 400);
+            frame(&mut app);
+            app.scroll = 50;
+            frame(&mut app);
+            assert!(app.scroll >= 50 && app.scroll < 400);
+            settle(&mut app);
+            assert_eq!(app.scroll, 400);
+
+            // A jump of many screens is not worth watching: it simply lands.
+            app.glide_to(hwnd, i32::MAX);
+            assert!(!app.animating);
             assert_eq!(app.scroll, app.content_height - app.height);
             app.glide_to(hwnd, -50);
-            settle(&mut app);
             assert_eq!(app.scroll, 0);
+            DestroyWindow(hwnd);
+        }
+    }
+    /// The heart of the blur fix. A scroll moves the pixels inside the back
+    /// buffer and draws only the strip that appears; the frame has to come out
+    /// exactly as a full repaint would draw it. Text blended onto itself, a stale
+    /// strip, or a scrollbar dragged along with the page all show up here.
+    #[test]
+    fn a_scrolled_frame_is_pixel_for_pixel_what_a_full_repaint_draws() {
+        unsafe {
+            let hwnd = window(640, 420);
+            let mut app = App::new();
+            let mut source = String::new();
+            for n in 0..60 {
+                source.push_str(&format!(
+                    "## Heading {n}\n\nA paragraph with **bold**, *italic*, `code`, a [link](x) and \
+                     enough words to wrap onto a second line of this narrow window. 😀\n\n\
+                     ```\nfn code_{n}() {{}}\n```\n\n> A quote\n\n| a | b |\n| - | - |\n| {n} | 世界 |\n\n"
+                ));
+            }
+            source.push_str("العربية **نص** and English\n\n");
+            document(&mut app, &source);
+            app.layout(hwnd);
+            InvalidateRect(hwnd, ptr::null(), 0);
+            app.paint(hwnd);
+            let (width, height) = (app.width, app.height);
+            let whole = Rect {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height + app.status(),
+            };
+            let farthest = app.content_height - app.height;
+            assert!(
+                farthest > 4 * height,
+                "the document must be long enough to scroll"
+            );
+            let mut at = 0;
+            // Small steps, big steps, both directions, and one past a whole screen.
+            for delta in [
+                1,
+                2,
+                3,
+                7,
+                22,
+                57,
+                -1,
+                -5,
+                -31,
+                130,
+                -200,
+                311,
+                -90,
+                height - 1,
+                1 - height,
+                2 * height,
+            ] {
+                at = (at + delta).clamp(0, farthest);
+                app.scroll_to(hwnd, at);
+                assert_eq!(app.scroll, at);
+                let reference = Buffer::new(NULL, whole.right, whole.bottom).unwrap();
+                app.draw(reference.dc, whole);
+                let (shown, expected) = (app.buffer.as_ref().unwrap().pixels(), reference.pixels());
+                let first_difference = (0..(width * height) as usize)
+                    .find(|&i| shown[i] & 0xffffff != expected[i] & 0xffffff);
+                assert_eq!(
+                    first_difference.map(|i| (i as i32 % width, i as i32 / width)),
+                    None,
+                    "scrolling by {delta} to {at} drew a different frame than a repaint"
+                );
+            }
+            // A new layout throws the old picture away, so a scroll can never
+            // move it into view; the next paint draws the new layout whole.
+            app.set_zoom(hwnd, 150);
+            assert!(
+                app.buffer.is_none(),
+                "a layout left a stale frame to scroll"
+            );
+            InvalidateRect(hwnd, ptr::null(), 0);
+            app.paint(hwnd);
+            let whole = Rect {
+                bottom: app.height + app.status(),
+                ..whole
+            };
+            let reference = Buffer::new(NULL, whole.right, whole.bottom).unwrap();
+            app.draw(reference.dc, whole);
+            let (shown, expected) = (app.buffer.as_ref().unwrap().pixels(), reference.pixels());
+            assert!(
+                (0..(width * app.height) as usize)
+                    .all(|i| shown[i] & 0xffffff == expected[i] & 0xffffff),
+                "the frame after a zoom is not what a full repaint draws"
+            );
             DestroyWindow(hwnd);
         }
     }

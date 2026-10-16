@@ -205,7 +205,7 @@ pub const WM_SETICON: u32 = 0x80;
 pub const WM_SETCURSOR: u32 = 0x20;
 pub const WM_DRAWITEM: u32 = 0x2b;
 pub const WM_MEASUREITEM: u32 = 0x2c;
-pub const WM_TIMER: u32 = 0x113;
+pub const WM_QUIT: u32 = 0x12;
 pub const WM_MOUSEMOVE: u32 = 0x200;
 pub const WM_LBUTTONDOWN: u32 = 0x201;
 pub const WM_LBUTTONUP: u32 = 0x202;
@@ -230,6 +230,7 @@ extern "system" {
     ) -> Hwnd;
     pub fn DefWindowProcW(hwnd: Hwnd, msg: u32, wp: usize, lp: isize) -> isize;
     pub fn GetMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32) -> i32;
+    pub fn PeekMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: u32) -> i32;
     pub fn TranslateMessage(msg: *const Msg) -> i32;
     pub fn DispatchMessageW(msg: *const Msg) -> isize;
     pub fn PostQuitMessage(code: i32);
@@ -260,16 +261,6 @@ extern "system" {
     pub fn SetScrollInfo(hwnd: Hwnd, bar: i32, info: *const ScrollInfo, redraw: i32) -> i32;
     #[cfg(test)]
     pub fn GetScrollInfo(hwnd: Hwnd, bar: i32, info: *mut ScrollInfo) -> i32;
-    pub fn ScrollWindowEx(
-        hwnd: Hwnd,
-        dx: i32,
-        dy: i32,
-        scroll: *const Rect,
-        clip: *const Rect,
-        region: Handle,
-        update: *mut Rect,
-        flags: u32,
-    ) -> i32;
     pub fn GetKeyState(key: i32) -> i16;
     pub fn SystemParametersInfoW(action: u32, param: u32, value: *mut c_void, flags: u32) -> i32;
     pub fn SetWindowTextW(hwnd: Hwnd, title: *const u16) -> i32;
@@ -296,7 +287,13 @@ extern "system" {
     pub fn IsWindow(hwnd: Hwnd) -> i32;
     pub fn IsDialogMessageW(hwnd: Hwnd, msg: *const Msg) -> i32;
     pub fn SetForegroundWindow(hwnd: Hwnd) -> i32;
-    pub fn AdjustWindowRect(rect: *mut Rect, style: u32, menu: i32) -> i32;
+    pub fn AdjustWindowRectExForDpi(
+        rect: *mut Rect,
+        style: u32,
+        menu: i32,
+        ex: u32,
+        dpi: u32,
+    ) -> i32;
     pub fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
     pub fn GetDlgItem(hwnd: Hwnd, id: i32) -> Hwnd;
     pub fn GetMenu(hwnd: Hwnd) -> Handle;
@@ -311,12 +308,13 @@ extern "system" {
     pub fn SetCapture(hwnd: Hwnd) -> Hwnd;
     pub fn ShowScrollBar(hwnd: Hwnd, bar: i32, show: i32) -> i32;
     pub fn ReleaseCapture() -> i32;
-    pub fn SetTimer(hwnd: Hwnd, id: usize, period: u32, proc: *const c_void) -> usize;
-    pub fn KillTimer(hwnd: Hwnd, id: usize) -> i32;
     pub fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, count: i32) -> i32;
     #[cfg(test)]
     pub fn PrintWindow(hwnd: Hwnd, dc: Hdc, flags: u32) -> i32;
     pub fn GetDpiForWindow(hwnd: Hwnd) -> u32;
+    #[cfg(test)]
+    pub fn GetWindow(hwnd: Hwnd, command: u32) -> Hwnd;
+    pub fn GetClassNameW(hwnd: Hwnd, name: *mut u16, count: i32) -> i32;
 }
 #[link(name = "gdi32")]
 extern "system" {
@@ -350,6 +348,9 @@ extern "system" {
         size: *mut Size,
     ) -> i32;
     pub fn SetBkMode(dc: Hdc, mode: i32) -> i32;
+    pub fn SaveDC(dc: Hdc) -> i32;
+    pub fn RestoreDC(dc: Hdc, saved: i32) -> i32;
+    pub fn IntersectClipRect(dc: Hdc, left: i32, top: i32, right: i32, bottom: i32) -> i32;
     pub fn SetTextColor(dc: Hdc, color: u32) -> u32;
     pub fn TextOutW(dc: Hdc, x: i32, y: i32, text: *const u16, len: i32) -> i32;
     pub fn CreateSolidBrush(color: u32) -> Handle;
@@ -381,6 +382,7 @@ extern "system" {
 }
 #[link(name = "kernel32")]
 extern "system" {
+    pub fn Sleep(milliseconds: u32);
     pub fn GetStringTypeW(kind: u32, text: *const u16, count: i32, properties: *mut u16) -> i32;
     pub fn GetModuleHandleW(name: *const u16) -> Handle;
     pub fn WritePrivateProfileStringW(
@@ -430,26 +432,19 @@ pub unsafe fn DwmSetWindowAttribute(
     })
 }
 
-/// Ask Windows for a finer timer tick while an animation runs, and give it
-/// back afterwards. Unavailable multimedia timers simply leave the default.
-pub unsafe fn frame_clock(fast: bool) {
-    type Period = unsafe extern "system" fn(u32) -> u32;
-    static FUNCTIONS: std::sync::OnceLock<Option<(Period, Period)>> = std::sync::OnceLock::new();
-    let functions = FUNCTIONS.get_or_init(|| {
-        let load = |name: &std::ffi::CStr| {
-            system_function("winmm.dll", name).map(|function| {
-                std::mem::transmute::<unsafe extern "system" fn() -> isize, Period>(function)
-            })
-        };
-        Some((load(c"timeBeginPeriod")?, load(c"timeEndPeriod")?))
+/// Wait for the next display refresh, so an animation steps once per frame the
+/// reader can actually see instead of on a timer that drifts against it.
+/// Returns false when the compositor cannot say (remote sessions, no DWM); the
+/// caller then paces itself.
+pub unsafe fn wait_for_refresh() -> bool {
+    type Flush = unsafe extern "system" fn() -> i32;
+    static FUNCTION: std::sync::OnceLock<Option<Flush>> = std::sync::OnceLock::new();
+    let flush = FUNCTION.get_or_init(|| {
+        system_function("dwmapi.dll", c"DwmFlush").map(|function| {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, Flush>(function)
+        })
     });
-    if let Some((begin, end)) = functions {
-        if fast {
-            begin(1);
-        } else {
-            end(1);
-        }
-    }
+    flush.is_some_and(|flush| flush() >= 0)
 }
 
 /// An off-screen 32-bit surface. The viewer composes each frame in one so
