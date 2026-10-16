@@ -56,7 +56,7 @@ Ordinary text is nowhere near any of these: the caps exist for files that are ma
 
 ## Themes
 
-Copy `mdlite.ini` beside the executable. **Every section except `[viewer]` is a palette, named by the section**, and a palette may list only the roles it wants to change:
+Settings live in `mdlite.ini`: beside the executable when one is there (a portable copy), otherwise in `%APPDATA%\MDLite`, where an installed copy keeps them (see [Installing](#installing)). To start from the shipped palettes, copy the repository's `mdlite.ini` to either place. **Every section except `[viewer]` is a palette, named by the section**, and a palette may list only the roles it wants to change:
 
 ```ini
 [Nord]
@@ -88,11 +88,15 @@ The file dialog and the settings window keep the system's own appearance: they a
 
 ## Scrolling
 
-The wheel, the arrows and the Page keys ease into place over about a fifth of a second, asking Windows for a finer timer tick while a scroll is running and giving it back the moment one finishes, so an idle window still costs nothing. Notches during a scroll add to where it is already going rather than restarting it. Dragging the scrollbar thumb is never animated: it is direct manipulation, and easing between the pointer and the page only feels like lag. Uncheck **Smooth scrolling** in the settings window, or set `[viewer] smooth=off`, for the instant jump.
+The wheel, the arrows and the Page keys ease towards where they are going, and notches during a scroll add to its destination rather than restarting it. Dragging the scrollbar thumb is never animated: it is direct manipulation, and easing between the pointer and the page only feels like lag. Uncheck **Smooth scrolling** in the settings window, or set `[viewer] smooth=off`, for the instant jump.
 
-The scrollbar itself is drawn by the viewer in the palette's own colours. Setting a scroll range is what makes Windows add `WS_VSCROLL` and put its own bar beside it, so the viewer hides that again whenever the range changes — never on a position update, which is what scrolling sends. The window still publishes its scroll position, range and page through the normal `SetScrollInfo` state.
+**What moves.** The position is a floating-point number that eases towards the target with an exponential ease-out (a 45 ms time constant, so a notch settles in about a third of a second), and the window shows it rounded to a whole pixel, so text always lands on the pixel grid and is never resampled. The step comes from the clock rather than the frame count, so a late frame covers more ground and the motion keeps its speed. Two limits keep it watchable: the view never travels faster than five screens a second, because past about a hundred pixels a frame the eye stops following the text and sees a smear, and a jump of more than four screens (Home and End on a long document) simply lands, because nobody wants to watch it. Wheel input is accumulated in pixels, honouring the system's lines-per-notch setting, so a precision touchpad's small deltas move the page at once and reversing the wheel cancels what is left of the other direction.
 
-Every frame is composed in a client-sized back buffer and reaches the window in one blit, so nothing is ever seen half-painted. A scroll copies the pixels that stay with `ScrollWindowEx` and repaints only the strip that exposes plus the part of the scrollbar thumb that moved; invalidating the whole bar instead would make the update region's bounding box cover the window, and every frame would redraw the page.
+**When it moves.** There is no timer. While a scroll is running the message loop answers whatever input is waiting, draws one frame, and sleeps in `DwmFlush` until the display can show it, so the animation steps once per refresh at whatever rate the monitor runs, 60 or 144 Hz alike. An idle window blocks in `GetMessageW` and costs nothing. If the compositor cannot say when the next refresh is (a remote session), the loop paces itself at 8 ms instead.
+
+**How a frame is made.** The back buffer, which is the size of the client area, is the one true copy of what is on screen. A scroll moves the pixels that stay with one `BitBlt` inside the buffer, draws only the strip that scrolls into view, redraws the scrollbar, and puts the whole text area on the window with a second `BitBlt`. The window is never in a state where text has moved and the strip beside it has not been drawn. The earlier design scrolled the window with `ScrollWindowEx` and painted the exposed strip in a later `WM_PAINT`, so the compositor could show a frame with the moved text and a stale strip, which at sixty frames a second would read as shimmer along the leading edge. Every draw is clipped to the rectangle it was asked for: a row that straddles the edge of the strip is drawn whole, and without the clip its text would be blended onto its own pixels once for every frame it crossed, thickening a little each time. A test scrolls a long document by sixteen different distances in both directions and requires each frame to match, pixel for pixel, what a full repaint draws at that position; with the clip removed it fails on the first one-pixel scroll.
+
+The window still publishes its scroll position, range and page through the normal `SetScrollInfo` state, and the scrollbar itself is drawn by the viewer in the palette's own colours. Setting a scroll range is what makes Windows add `WS_VSCROLL` and put its own bar beside it, so the viewer hides that again whenever the range changes, never on a position update, which is what scrolling sends.
 
 ## Status bar
 
@@ -121,13 +125,13 @@ MSVC builds statically link the CRT. The interning tables keep the standard hash
 
 See [validation.md](validation.md) for test coverage, before-and-after timings, and colour-emoji screenshots.
 
-- A blocking `GetMessageW` loop uses no timers or continuous rendering.
+- A blocking `GetMessageW` loop uses no timers or continuous rendering. Only while a scroll is animating does the loop pace itself, once per display refresh, and it goes back to blocking the moment the scroll lands.
 - Parsing happens on open/reload. Text is converted to UTF-16 once and reused.
 - A bounded temporary index shares repeated text spans and is freed after parsing.
 - Layout caches full-span widths and reuses them when they fit the new line width. Fonts and widths are invalidated on DPI changes.
 - Queued resize work is coalesced so an already-handled resize does not trigger a second layout.
 - Painting binary-searches the visible rows and respects the invalidated paint region.
-- Scrolling copies existing pixels with `ScrollWindowEx` and paints the exposed strip.
+- Scrolling moves existing pixels inside the back buffer and draws only the exposed strip, then presents the frame in one blit.
 - GDI's stock brush avoids allocating brushes during painting.
 - DirectWrite, Direct2D and GDI+ load lazily from System32, and only when a block needs them. A document of plain Latin text touches none of them.
 - Shaped paragraph layouts are cached and shared between identical paragraphs; the cache is bounded and keyed by text, size and width. Emoji clusters are interned across the whole document, so a page of identical emoji is shaped once.
@@ -136,7 +140,7 @@ See [validation.md](validation.md) for test coverage, before-and-after timings, 
 - Table columns are measured once per table from cached span widths, then laid out like any other text.
 - Menu painting reads its font and palette from a small thread-local, because Windows asks for it from inside `SetMenu` and `DrawMenuBar`, which the viewer calls while its own state is borrowed.
 - The scrollbar costs two fills and no window of its own; scrolling copies pixels around it rather than through it.
-- A scroll animation runs on one timer that exists only while it is moving, and each frame repaints the strip that ScrollWindowEx exposes, not the page.
+- A scroll animation draws one strip per refresh, not the page, and the footer and the settings window cost nothing while it runs.
 - The back buffer is the size of the client area, not of the document, and is rebuilt only when that size changes.
 - No GPU swap chain, offscreen full-document bitmap, file watcher, or background worker.
 
@@ -145,6 +149,18 @@ The approach uses the documented [Windows GDI text API](https://learn.microsoft.
 `src/markdown.rs` contains the parser, `src/theme.rs` the named palettes and INI loader, `src/viewer.rs` layout, painting, the status bar and the settings window, `src/render.rs` the pipeline choice and the GDI+ backend, `src/dwrite.rs` the DirectWrite and Direct2D backend, and `src/win32.rs` the basic ABI bindings.
 
 Two ignored tests exist for working on layout rather than asserting it: `cargo test --offline -- --ignored --nocapture preview` renders the example documents and the settings window off-screen into bitmaps in `%TEMP%`, and `... --ignored --nocapture bench` reports where parsing, first layout and relayout time goes on a large document.
+
+## Installing
+
+`installer\mdlite.iss` is an [Inno Setup](https://jrsoftware.org/isinfo.php) script; `installer\build-installer.ps1` builds the program, takes the version from `Cargo.toml`, and compiles `dist\installer\MDLite-Setup-<version>.exe`. The program is still one file that needs no installing. The installer adds what a file cannot: a place in the Start menu and in Windows Settings > Apps, file types, and a way back out.
+
+**Where things go.** For one user by default, under `%LOCALAPPDATA%\Programs\MDLite`, with no administrator rights; the wizard's first page offers all users, which installs under Program Files and asks Windows for permission. Program Files is not writable by the person using the program, and the program writes its settings back, so an installed MDLite keeps them in `%APPDATA%\MDLite\mdlite.ini`. The installer ships its palettes as `mdlite.default.ini` beside the program and never as the live file; `src\config.rs` copies it into the profile on first run, and never over an existing one. A `mdlite.ini` beside the program wins, which is what keeps a copy carried around on a USB stick portable. Tests never read the profile of whoever runs them.
+
+**File types.** Registering is not claiming. The installer, and the same code behind **Settings > Set as default .md reader** (`src\association.rs`), write a program entry for `.md`, `.markdown`, `.mdown` and `.mkd` (open command, icon, "Open with" listing, and the capabilities Windows shows under Default apps) without changing what any extension opens with. Only with the **Make MDLite the default reader** task ticked, and only for an extension that nothing opens yet, is MDLite also made the default, because that is the one case Windows lets a program decide for itself. Where another program already owns the type, the last page of the wizard opens Windows Default apps with MDLite already listed. The two writers use the same keys, so whichever ran last leaves a consistent registry, and a test registers and unregisters into a throwaway registry root so the machine's real associations are never touched.
+
+**Leaving.** The uninstaller runs `mdlite.exe --close`, which asks any other running copy of that very file to quit (it matches by the image path, so a copy in another folder is left alone) because an open program cannot be deleted, then `mdlite.exe --unregister`, which removes what the Settings button may have registered since. Inno removes everything the installer wrote, the empty keys it created included. Settings are the reader's rather than the program's, so an interactive uninstall asks before deleting `%APPDATA%\MDLite`, and a silent one keeps them unless given `/purge=1`. An upgrade runs `--close` too, then replaces the files in place under the same application id, so there is one entry in Apps & features.
+
+`installer\verify-installer.ps1` proves it on the machine it runs on: a silent per-user install into a scratch folder, the files and registry it should have made, a first run against an empty settings folder, an uninstall, and a comparison of the registry with a snapshot taken beforehand. `-RunningApp` uninstalls with MDLite open, and `-Upgrade` installs over it twice.
 
 ## Building
 

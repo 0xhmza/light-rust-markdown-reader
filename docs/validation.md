@@ -1,5 +1,54 @@
 # Validation
 
+## 2026-10-16 — sharper scrolling, a settings window that cannot overlap, an installer and an uninstaller
+
+69 Rust tests pass, plus four ignored ones kept for looking at output, and the offscreen smoke test passes on the shipped build. `dist\mdlite.exe` is 451,072 bytes, built with Rust 1.99.1, the x86_64 GNU Windows toolchain and the `small` profile; the installer is 2,218.6 KiB (Inno Setup 6.7.3), version 0.2.0.
+
+### Scrolling
+
+Each frame used to be made in two steps: `ScrollWindowEx` moved the window's own pixels, and the strip that scrolled into view was painted by a later `WM_PAINT`. The compositor could show the window between the two. Frames also came from an 8 ms timer that rounded every step to a whole pixel, which does not line up with a 60 Hz display, and early frames of a long scroll jumped well over a hundred pixels.
+
+- **One atomic frame.** The back buffer is now the one true copy of the screen. A scroll moves the pixels that stay inside it, draws only the new strip, redraws the scrollbar, and puts the text area on the window in a single blit. `a_scrolled_frame_is_pixel_for_pixel_what_a_full_repaint_draws` scrolls a mixed document (headings, wrapped paragraphs, inline code, links, a code block, a quote, a table, emoji, Arabic) by sixteen distances in both directions, including one and two whole screens, and requires every frame to equal what a full repaint draws at that position, and again after a zoom. Every draw is now clipped to the rectangle it was asked for. **Checked by breaking it:** with the clip removed, the same test fails on the very first one-pixel scroll, because rows that straddle the strip have their text blended onto itself.
+- **Paced to the display.** No timer and no `timeBeginPeriod`: while a scroll runs, the loop draws a frame and waits in `DwmFlush` for the next refresh; an idle window blocks in `GetMessageW`. Measured live on this machine's 60 Hz panel with `scripts\scroll-probe.ps1`, driving the real exe off-screen with wheel messages: positions changed every 15 to 17 ms when the sampler was not itself being delayed, one notch (72 px) settled in 360 to 490 ms, and idle CPU over the following second was 0 ms.
+- **Eased by the clock, to a whole pixel.** The position is a float eased with a 45 ms time constant, shown rounded, so text stays on the pixel grid; a test requires that a late 100 ms frame covers several times the ground of an 8 ms one, that the position never moves backwards or past the target, and that something else moving the view (a reload) is carried on from.
+- **Never faster than the eye.** Capped at five screens a second: with the cap, a 20-notch spin (1,440 px) moved a steady 59 to 63 px a frame, where the uncapped ease would start near 450 (worked out from its formula, not measured). A test requires no frame to exceed the cap. Jumps of more than four screens land at once.
+- **A relayout throws the picture away.** `layout()` drops the buffer, since it holds the old layout and a scroll would move it into view; a test checks this.
+- Smooth scrolling off still jumps in a single move (the probe saw one position change).
+
+### The settings window
+
+The window used to be a set of fixed rectangles, and the first version of them overlapped: a "Zoom control" check box sat under the OK button. It is now laid out from measurement: the font is built for the window's DPI, every label is measured with `DrawText` at its real width, check boxes and radio buttons wrap rather than clip, rows are placed under one another, group boxes are sized to what they hold, and the window is sized around the result with `AdjustWindowRectExForDpi`. The text that changes with the selection (the note under the pipelines, the line about the open document, the default-reader status) keeps room for its longest variant. `the_settings_window_never_overlaps_or_clips_at_any_scale` builds it at 96, 120, 144, 168, 192 and 288 DPI and requires that no control leaves the window, no two controls overlap, every control but the buttons row sits inside a group box, and every piece of text fits the control that carries it.
+
+### Where settings live
+
+`src\config.rs`: an `mdlite.ini` beside the program is used as it is (portable); otherwise `%APPDATA%\MDLite\mdlite.ini`, started from `mdlite.default.ini` on first run and never overwritten after. Tests cover the portable case, the installed case, an existing file surviving a second run, and a missing template or profile. Test runs never touch the real profile.
+
+### The installer
+
+`installer\mdlite.iss`, built by `installer\build-installer.ps1`. `installer\verify-installer.ps1` runs the real thing: a silent per-user install into a scratch folder, then checks, then an uninstall, then a diff of this account's registry against a snapshot taken first. All of this passed on the final build, in three modes: plain, uninstalling while MDLite is open, and installing a second time over an open copy.
+
+- Installed: the program, `mdlite.default.ini`, README, licence, the examples, the uninstaller, a Start menu shortcut and an Apps & features entry; no live `mdlite.ini` beside the program.
+- Registered: the program entry, "Open with" for `.md`, `.markdown`, `.mdown` and `.mkd`, the Default apps capabilities, and `RegisteredApplications`. With the task ticked and nothing opening `.md` beforehand, `.md` opened with MDLite.
+- First run with an empty profile created `%APPDATA%\MDLite\mdlite.ini` holding the shipped palettes.
+- Uninstall removed the folder, the entries and the shortcut; **every registry value matched the snapshot** (empty keys are not compared, and the uninstaller removes the ones it left); a silent uninstall kept the settings, as designed (`/purge=1` deletes them).
+- **A bug the first uninstall test found:** uninstalling while MDLite was open completed but left the program folder behind, because an open program cannot be deleted. `mdlite.exe --close` now asks any running copy of that very file (matched by image path, so another folder's copy is left alone) to quit, and the uninstaller and an upgrade run it first. The same run showed the upgrade path works and leaves one uninstall entry.
+- `mdlite.exe --unregister` removes what the Settings button may have registered since; `association.rs` registers into and unregisters from a throwaway registry root in its test, including leaving an extension that opens with something else alone.
+
+### Graphify
+
+`graphify extract . --code-only` (local tree-sitter, no API key): 588 nodes, 1,726 edges, 29 communities over 20 code files. `graphify query "how does smooth scrolling present a frame"` reaches `.present()`, `.scroll_to()`, `.draw()` and the tests that cover them. The hooks it registers were pointed at `python -m graphify` because the `graphify` script is not on this machine's PATH.
+
+### Not checked
+
+- An extension that something else already opens: the installer leaves it alone by the same check that was exercised the other way, but no such program was on this machine to prove it.
+- An all-users install: it needs an elevation prompt, so only the per-user path was run. The script uses the same `HKA` keys and `{autopf}` either way.
+- Windows 10. Everything was run on Windows 11 build 26300.
+- Scrolling by eye. The numbers above are the pixels and the cadence; whether it looks right on a given display is something to confirm there. The earlier artefact could not be reproduced in a screenshot, so the claim is that the two mechanisms that could produce it are gone and the pixels are proven exact, not that a before-and-after video was compared.
+- The Windows Default apps page opening for `registeredAppUser=MDLite` was not exercised here.
+- The installer is not code-signed, so Windows SmartScreen may warn when it is downloaded.
+
+Release SHA-256: `00A0273E592D9DCFCA2BF14C23D6F39ED5E82652463FA429B972493AA627BB09` (`mdlite.exe`), `F47EB4D275F37689BA4361BD3F693B39DDEDEF4DA2BD93822B6D4A365535E644` (`MDLite-Setup-0.2.0.exe`).
+
 ## 2026-09-06 — three pipelines, tables, palettes, chrome, scrolling, zoom, an icon and hardening
 
 56 Rust tests pass, plus three ignored ones kept for looking at output rather than asserting it, and the offscreen Windows UI smoke test passes. The shipped binary is 440,832 bytes (431 KiB), built with Rust 1.90.0, the x86_64 GNU Windows toolchain, and the `small` profile, icon included.

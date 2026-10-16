@@ -7,6 +7,8 @@
 *.ini     text
 # PowerShell is only ever run on Windows; keep CRLF so editors there behave.
 *.ps1     text eol=crlf
+# Inno Setup reads a script without a byte order mark as ANSI: keep it ASCII.
+*.iss     text eol=crlf
 
 *.ico     binary
 *.png     binary
