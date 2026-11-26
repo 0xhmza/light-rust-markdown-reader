@@ -27,7 +27,6 @@ try {
     New-Item -ItemType Directory -Path dist -Force | Out-Null
     Copy-Item -LiteralPath "target\$Profile\mdlite.exe" -Destination dist\mdlite.exe
     # The toolchain has no resource compiler, so the icon goes on afterwards.
-    if (-not (Test-Path -LiteralPath assets\mdlite.ico)) { & scripts\make-icon.ps1 | Out-Null }
     & scripts\set-icon.ps1 | Out-Null
     # Preserve any palette the user has already customized.
     if (-not (Test-Path -LiteralPath dist\mdlite.ini)) {
