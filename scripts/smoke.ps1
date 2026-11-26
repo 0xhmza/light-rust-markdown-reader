@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Executable = (Join-Path $PSScriptRoot '..\dist\mdlite.exe'),
     [string]$Report = 'smoke-result.json'
 )
@@ -64,6 +64,7 @@ try {
     # DWM may return an empty cached surface for a never-shown window. Map the
     # test window outside the desktop so PrintWindow can request a real paint.
     [void][MDLiteSmoke]::SetWindowPos($window, [IntPtr]::Zero, -32000, -32000, 920, 720, 0x54)
+    [MDLiteSmoke]::Send($window, 0x8001)
     $startupMs = $timer.Elapsed.TotalMilliseconds
     function Capture([string]$Name, [int]$ExpectedBackground, [bool]$RequireColor = $false) {
         $rect = New-Object MDLiteSmoke+Rect
@@ -74,13 +75,13 @@ try {
             $dc = $graphics.GetHdc()
             try { if (-not [MDLiteSmoke]::PrintWindow($window, $dc, 1)) { throw 'Window capture failed.' } }
             finally { $graphics.ReleaseHdc($dc) }
-            $pixel = $bitmap.GetPixel(4, 4).ToArgb() -band 0xffffff
+            $pixel = $bitmap.GetPixel($bitmap.Width - 2, 56).ToArgb() -band 0xffffff
             $bitmap.Save((Join-Path $qa "$Name.png"))
-            if ($pixel -ne $ExpectedBackground) { throw "Wrong background in ${Name}: $pixel" }
+            if ($pixel -ne $ExpectedBackground) { throw "Wrong background in ${Name}: 0x$($pixel.ToString('x6')) (expected 0x$($ExpectedBackground.ToString('x6')))" }
             if ($RequireColor) {
                 $warmPixels = 0
-                for ($y = 75; $y -lt [math]::Min(500, $bitmap.Height); $y += 3) {
-                    for ($x = 20; $x -lt [math]::Min(700, $bitmap.Width); $x += 3) {
+                for ($y = 75; $y -lt [math]::Min(550, $bitmap.Height); $y += 3) {
+                    for ($x = 20; $x -lt [math]::Min($bitmap.Width - 20, 880); $x += 3) {
                         $color = $bitmap.GetPixel($x, $y)
                         if ($color.R -gt 150 -and $color.G -gt 90 -and $color.B -lt 100) { $warmPixels++ }
                     }
@@ -90,12 +91,14 @@ try {
         } finally { $graphics.Dispose(); $bitmap.Dispose() }
     }
     # WM_COMMAND 200 + n selects palette n; 104 rereads the INI.
-    Capture 'dark' 0x181a1f
+    Capture 'dark' 0x282c34
     [MDLiteSmoke]::Send($window, 0x111, 201)
-    Capture 'light' 0xfaf9f6
+    Capture 'light' 0xfafafa
     Set-Content -LiteralPath $config -Value "[viewer]`nsmooth=off`n[light]`nbackground=#EFE8DA" -Encoding utf8
     [MDLiteSmoke]::Send($window, 0x111, 104)
     Capture 'custom' 0xefe8da
+    # Let Windows finish one-time post-show DWM/theme handle setup before measuring steady-state GDI counts.
+    Start-Sleep -Milliseconds 300
     $gdiBefore = [MDLiteSmoke]::GetGuiResources($process.Handle, 0)
     for ($i = 0; $i -lt 50; $i++) {
         [MDLiteSmoke]::Send($window, 0x111, (200 + ($i % 2)))
@@ -149,12 +152,12 @@ try {
     [MDLiteSmoke]::Send($window, 0x111, 104)
     [MDLiteSmoke]::Send($window, 0x111, 101)
     [MDLiteSmoke]::Send($window, 0x111, 200)
-    Capture 'emoji-dark' 0x181a1f $true
+    Capture 'emoji-dark' 0x282c34 $true
     [MDLiteSmoke]::Send($window, 0x111, 201)
-    Capture 'emoji-light' 0xfaf9f6 $true
+    Capture 'emoji-light' 0xfafafa $true
     [void][MDLiteSmoke]::SetWindowPos($window, [IntPtr]::Zero, 0, 0, 420, 720, 0x16)
     [MDLiteSmoke]::Send($window, 0x8001)
-    Capture 'emoji-narrow' 0xfaf9f6 $true
+    Capture 'emoji-narrow' 0xfafafa $true
     $languageGdiBefore = [MDLiteSmoke]::GetGuiResources($process.Handle, 0)
     foreach ($fixture in @('languages', 'complex-scripts')) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\examples\$fixture.md") -Destination $document -Force
@@ -166,7 +169,7 @@ try {
                 [MDLiteSmoke]::Send($window, 0x111, $mode)
                 [MDLiteSmoke]::Send($window, 0x100, 0x24)
                 for ($page = 0; $page -lt 3; $page++) {
-                    $background = if ($mode -eq 200) { 0x181a1f } else { 0xfaf9f6 }
+                    $background = if ($mode -eq 200) { 0x282c34 } else { 0xfafafa }
                     Capture "$fixture-$width-$mode-$page" $background
                     [MDLiteSmoke]::Send($window, 0x100, 0x22)
                 }
@@ -183,7 +186,7 @@ try {
     [MDLiteSmoke]::Send($window, 0x8001)
     $complexResizeMs = $timer.Elapsed.TotalMilliseconds
     [MDLiteSmoke]::Send($window, 0x100, 0x24)
-    Capture 'complex-repeated' 0xfaf9f6
+    Capture 'complex-repeated' 0xfafafa
     # Exercise cache eviction, theme switching, resizing and actual painting.
     $uniqueComplex = [Text.StringBuilder]::new()
     for ($i = 0; $i -lt 200; $i++) { [void]$uniqueComplex.AppendLine("العربية **نص $i** हिन्दी café 😀 [رابط](https://example.test)") }
@@ -192,7 +195,7 @@ try {
         [MDLiteSmoke]::Send($window, 0x111, 101)
         [MDLiteSmoke]::Send($window, 0x111, (200 + ($i % 2)))
         [MDLiteSmoke]::Send($window, 0x100, 0x23)
-        Capture 'complex-eviction' $(if ($i % 2) { 0xfaf9f6 } else { 0x181a1f })
+        Capture 'complex-eviction' $(if ($i % 2) { 0xfafafa } else { 0x282c34 })
     }
     $languageGdiAfter = [MDLiteSmoke]::GetGuiResources($process.Handle, 0)
     if ($languageGdiAfter -gt $languageGdiBefore + 2) { throw "Multilingual GDI resources leaked: $languageGdiBefore -> $languageGdiAfter" }

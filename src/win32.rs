@@ -202,13 +202,24 @@ pub const WM_DROPFILES: u32 = 0x233;
 pub const WM_DPICHANGED: u32 = 0x2e0;
 pub const WM_CLOSE: u32 = 0x10;
 pub const WM_SETICON: u32 = 0x80;
+pub const WM_NCPAINT: u32 = 0x85;
+pub const WM_NCACTIVATE: u32 = 0x86;
 pub const WM_SETCURSOR: u32 = 0x20;
 pub const WM_DRAWITEM: u32 = 0x2b;
 pub const WM_MEASUREITEM: u32 = 0x2c;
+pub const WM_CTLCOLOREDIT: u32 = 0x133;
+pub const WM_CTLCOLORLISTBOX: u32 = 0x134;
+pub const WM_CTLCOLORBTN: u32 = 0x135;
+pub const WM_CTLCOLORDLG: u32 = 0x136;
+pub const WM_CTLCOLORSTATIC: u32 = 0x138;
 pub const WM_QUIT: u32 = 0x12;
 pub const WM_MOUSEMOVE: u32 = 0x200;
 pub const WM_LBUTTONDOWN: u32 = 0x201;
 pub const WM_LBUTTONUP: u32 = 0x202;
+pub const WM_LBUTTONDBLCLK: u32 = 0x203;
+pub const WM_RBUTTONUP: u32 = 0x205;
+pub const WM_MBUTTONUP: u32 = 0x208;
+pub const WM_MOUSELEAVE: u32 = 0x2a3;
 pub const WM_APP_LAYOUT: u32 = 0x8001;
 
 #[link(name = "user32")]
@@ -253,7 +264,9 @@ extern "system" {
     pub fn GetParent(hwnd: Hwnd) -> Hwnd;
     pub fn GetClientRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
     pub fn GetDC(hwnd: Hwnd) -> Hdc;
+    pub fn GetWindowDC(hwnd: Hwnd) -> Hdc;
     pub fn ReleaseDC(hwnd: Hwnd, dc: Hdc) -> i32;
+    pub fn SetWindowRgn(hwnd: Hwnd, rgn: Handle, redraw: i32) -> i32;
     pub fn BeginPaint(hwnd: Hwnd, paint: *mut PaintStruct) -> Hdc;
     pub fn EndPaint(hwnd: Hwnd, paint: *const PaintStruct) -> i32;
     pub fn FillRect(dc: Hdc, rect: *const Rect, brush: Handle) -> i32;
@@ -301,18 +314,28 @@ extern "system" {
     pub fn DrawMenuBar(hwnd: Hwnd) -> i32;
     pub fn DestroyMenu(menu: Handle) -> i32;
     pub fn DrawTextW(dc: Hdc, text: *const u16, count: i32, rect: *mut Rect, format: u32) -> i32;
-    pub fn FrameRect(dc: Hdc, rect: *const Rect, brush: Handle) -> i32;
     pub fn SetCursor(cursor: Handle) -> Handle;
     pub fn GetCursorPos(point: *mut Point) -> i32;
     pub fn ScreenToClient(hwnd: Hwnd, point: *mut Point) -> i32;
+    pub fn ClientToScreen(hwnd: Hwnd, point: *mut Point) -> i32;
+    pub fn TrackPopupMenu(
+        menu: Handle,
+        flags: u32,
+        x: i32,
+        y: i32,
+        reserved: i32,
+        hwnd: Hwnd,
+        rect: *const Rect,
+    ) -> i32;
+    pub fn OpenClipboard(hwnd: Hwnd) -> i32;
+    pub fn CloseClipboard() -> i32;
+    pub fn EmptyClipboard() -> i32;
+    pub fn SetClipboardData(format: u32, mem: Handle) -> Handle;
     pub fn SetCapture(hwnd: Hwnd) -> Hwnd;
     pub fn ShowScrollBar(hwnd: Hwnd, bar: i32, show: i32) -> i32;
     pub fn ReleaseCapture() -> i32;
     pub fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, count: i32) -> i32;
-    #[cfg(test)]
-    pub fn PrintWindow(hwnd: Hwnd, dc: Hdc, flags: u32) -> i32;
     pub fn GetDpiForWindow(hwnd: Hwnd) -> u32;
-    #[cfg(test)]
     pub fn GetWindow(hwnd: Hwnd, command: u32) -> Hwnd;
     pub fn GetClassNameW(hwnd: Hwnd, name: *mut u16, count: i32) -> i32;
 }
@@ -337,6 +360,7 @@ extern "system" {
     pub fn DeleteObject(object: Handle) -> i32;
     pub fn SelectObject(dc: Hdc, object: Handle) -> Handle;
     pub fn GetTextMetricsW(dc: Hdc, metrics: *mut TextMetric) -> i32;
+    pub fn GetCharWidth32W(dc: Hdc, first: u32, last: u32, buffer: *mut i32) -> i32;
     pub fn GetTextExtentPoint32W(dc: Hdc, text: *const u16, count: i32, size: *mut Size) -> i32;
     pub fn GetTextExtentExPointW(
         dc: Hdc,
@@ -348,14 +372,34 @@ extern "system" {
         size: *mut Size,
     ) -> i32;
     pub fn SetBkMode(dc: Hdc, mode: i32) -> i32;
+    pub fn SetBkColor(dc: Hdc, color: u32) -> u32;
     pub fn SaveDC(dc: Hdc) -> i32;
     pub fn RestoreDC(dc: Hdc, saved: i32) -> i32;
     pub fn IntersectClipRect(dc: Hdc, left: i32, top: i32, right: i32, bottom: i32) -> i32;
     pub fn SetTextColor(dc: Hdc, color: u32) -> u32;
+    pub fn GetTextFaceW(dc: Hdc, count: i32, name: *mut u16) -> i32;
     pub fn TextOutW(dc: Hdc, x: i32, y: i32, text: *const u16, len: i32) -> i32;
     pub fn CreateSolidBrush(color: u32) -> Handle;
+    pub fn CreateRoundRectRgn(
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        width: i32,
+        height: i32,
+    ) -> Handle;
     pub fn GetStockObject(object: i32) -> Handle;
     pub fn SetDCBrushColor(dc: Hdc, color: u32) -> u32;
+    pub fn SetDCPenColor(dc: Hdc, color: u32) -> u32;
+    pub fn RoundRect(
+        dc: Hdc,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        width: i32,
+        height: i32,
+    ) -> i32;
     pub fn CreateCompatibleDC(dc: Hdc) -> Hdc;
     pub fn DeleteDC(dc: Hdc) -> i32;
     pub fn CreateDIBSection(
@@ -383,6 +427,10 @@ extern "system" {
 #[link(name = "kernel32")]
 extern "system" {
     pub fn Sleep(milliseconds: u32);
+    pub fn GlobalAlloc(flags: u32, bytes: usize) -> Handle;
+    pub fn GlobalLock(mem: Handle) -> *mut c_void;
+    pub fn GlobalUnlock(mem: Handle) -> i32;
+    pub fn GlobalFree(mem: Handle) -> Handle;
     pub fn GetStringTypeW(kind: u32, text: *const u16, count: i32, properties: *mut u16) -> i32;
     pub fn GetModuleHandleW(name: *const u16) -> Handle;
     pub fn WritePrivateProfileStringW(
@@ -407,6 +455,14 @@ extern "system" {
     pub fn DragAcceptFiles(hwnd: Hwnd, accept: i32);
     pub fn DragQueryFileW(drop: Handle, index: u32, file: *mut u16, length: u32) -> u32;
     pub fn DragFinish(drop: Handle);
+    pub fn ShellExecuteW(
+        hwnd: Hwnd,
+        operation: *const u16,
+        file: *const u16,
+        parameters: *const u16,
+        directory: *const u16,
+        show: i32,
+    ) -> Handle;
 }
 pub unsafe fn DwmSetWindowAttribute(
     hwnd: Hwnd,
@@ -430,6 +486,29 @@ pub unsafe fn DwmSetWindowAttribute(
     function.map_or(0x80004001u32 as i32, |function| {
         function(hwnd, attribute, value, size)
     })
+}
+
+/// Apply or clear a UxTheme visual style on a Win32 control (loaded dynamically
+/// from System32 so no extra PE import dependency is introduced).
+pub unsafe fn set_window_theme(hwnd: Hwnd, sub_app: &str, sub_id: Option<&str>) {
+    type SetTheme = unsafe extern "system" fn(Hwnd, *const u16, *const u16) -> i32;
+    static FUNCTION: std::sync::OnceLock<Option<SetTheme>> = std::sync::OnceLock::new();
+    let func = FUNCTION.get_or_init(|| {
+        system_function("uxtheme.dll", c"SetWindowTheme")
+            .map(|f| std::mem::transmute::<unsafe extern "system" fn() -> isize, SetTheme>(f))
+    });
+    if let Some(func) = func {
+        let app_w = wide(sub_app);
+        match sub_id {
+            Some(id) => {
+                let id_w = wide(id);
+                func(hwnd, app_w.as_ptr(), id_w.as_ptr());
+            }
+            None => {
+                func(hwnd, app_w.as_ptr(), std::ptr::null());
+            }
+        }
+    }
 }
 
 /// Wait for the next display refresh, so an animation steps once per frame the

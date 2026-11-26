@@ -34,12 +34,14 @@ fn resolve(exe: &Path, appdata: Option<&Path>) -> PathBuf {
 /// install has every palette. Failure is harmless: the program runs without a
 /// file, and says so when a setting cannot be saved.
 fn prepare(path: &Path, template: &Path) {
+    // Fast path: once the settings file exists, skip redundant directory creation.
+    if path.exists() {
+        return;
+    }
     if let Some(folder) = path.parent() {
         let _ = std::fs::create_dir_all(folder);
     }
-    if !path.exists() {
-        let _ = std::fs::copy(template, path);
-    }
+    let _ = std::fs::copy(template, path);
 }
 
 #[cfg(test)]

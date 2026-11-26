@@ -11,10 +11,16 @@ use crate::{
 };
 use std::{cell::Cell, collections::VecDeque, ffi::c_void, ptr, rc::Rc};
 
-// Split emoji sequences as indivisible layout units. Keep VS15 text presentation
-// on GDI; preserve modifiers, ZWJ, regional pairs, keycaps and tag sequences.
-pub fn split(text: &str) -> Vec<(&str, bool)> {
-    let mut result = Vec::new();
+// Split emoji sequences as indivisible layout units without heap allocation.
+// Keep VS15 text presentation on GDI; preserve modifiers, ZWJ, regional pairs,
+// keycaps and tag sequences.
+pub fn for_each_cluster<'a>(text: &'a str, mut emit: impl FnMut(&'a str, bool)) {
+    // Pure ASCII can never contain colour emoji or keycap combining marks (U+20E3).
+    if text.is_ascii() {
+        emit(text, false);
+        return;
+    }
+    let mut emitted = false;
     let mut iter = text.char_indices().peekable();
     let mut plain = 0;
     while let Some((start, ch)) = iter.next() {
@@ -57,19 +63,20 @@ pub fn split(text: &str) -> Vec<(&str, bool)> {
             continue;
         }
         if plain < start {
-            result.push((&text[plain..start], false));
+            emit(&text[plain..start], false);
         }
-        result.push((&text[start..end], true));
+        emit(&text[start..end], true);
+        emitted = true;
         plain = end;
         iter = scan;
     }
     if plain < text.len() {
-        result.push((&text[plain..], false));
+        emit(&text[plain..], false);
+        emitted = true;
     }
-    if result.is_empty() {
-        result.push((text, false));
+    if !emitted {
+        emit(text, false);
     }
-    result
 }
 
 #[repr(C)]
@@ -194,6 +201,20 @@ struct LineMetrics {
     trimmed: i32,
 }
 
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct HitTestMetrics {
+    pub text_position: u32,
+    pub length: u32,
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+    pub bidi_level: u32,
+    pub is_text: i32,
+    pub is_trimmed: i32,
+}
+
 pub struct Layout {
     object: Com,
     pub width: i32,
@@ -204,6 +225,71 @@ pub struct Layout {
     /// Distance from the top of the layout to its first baseline. Only a
     /// colour cluster sitting inside a line of GDI text needs it.
     pub ascent: i32,
+}
+impl Layout {
+    /// Map a point relative to the layout's origin to a UTF-16 character index
+    /// and whether the point actually landed inside text.
+    pub unsafe fn hit_test_point(&self, x: f32, y: f32) -> (u32, bool) {
+        let (mut trailing, mut inside) = (0i32, 0i32);
+        let mut metrics = HitTestMetrics::default();
+        let hr = call!(self.object.0, 64, (
+            x => f32,
+            y => f32,
+            &mut trailing => *mut i32,
+            &mut inside => *mut i32,
+            &mut metrics => *mut HitTestMetrics
+        ) -> i32);
+        if hr < 0 {
+            return (0, false);
+        }
+        let pos = if trailing != 0 {
+            metrics.text_position.saturating_add(metrics.length)
+        } else {
+            metrics.text_position
+        };
+        (pos, inside != 0 && metrics.is_text != 0)
+    }
+    /// Bounding rectangles (relative to `origin_x`, `origin_y`) for a UTF-16 range.
+    pub unsafe fn hit_test_range(
+        &self,
+        start: u32,
+        length: u32,
+        origin_x: f32,
+        origin_y: f32,
+    ) -> Vec<HitTestMetrics> {
+        if length == 0 {
+            return Vec::new();
+        }
+        let mut count = 0u32;
+        let _ = call!(self.object.0, 66, (
+            start => u32,
+            length => u32,
+            origin_x => f32,
+            origin_y => f32,
+            ptr::null_mut() => *mut HitTestMetrics,
+            0 => u32,
+            &mut count => *mut u32
+        ) -> i32);
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut out = vec![HitTestMetrics::default(); count as usize];
+        let mut actual = 0u32;
+        let hr = call!(self.object.0, 66, (
+            start => u32,
+            length => u32,
+            origin_x => f32,
+            origin_y => f32,
+            out.as_mut_ptr() => *mut HitTestMetrics,
+            count => u32,
+            &mut actual => *mut u32
+        ) -> i32);
+        if hr < 0 {
+            return Vec::new();
+        }
+        out.truncate(actual as usize);
+        out
+    }
 }
 
 // Direct2D. Slot indices follow d2d1.h: ID2D1Factory::CreateDCRenderTarget is
@@ -294,15 +380,16 @@ unsafe fn direct2d() -> Option<Direct2D> {
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct TextRange {
-    start: u32,
-    length: u32,
+pub struct TextRange {
+    pub start: u32,
+    pub length: u32,
 }
 
 #[derive(PartialEq, Eq, Hash)]
 pub struct RichText {
     pub text: Box<[u16]>,
-    ranges: Vec<(TextRange, u8)>,
+    pub ranges: Vec<(TextRange, u8)>,
+    pub links: Vec<(TextRange, u32)>,
     rtl: bool,
 }
 impl RichText {
@@ -310,26 +397,43 @@ impl RichText {
     pub fn rtl(&self) -> bool {
         self.rtl
     }
-    pub fn new(spans: &[Span]) -> Self {
+    /// Link table index covering UTF-16 offset `pos`, if any.
+    pub fn link_at(&self, pos: u32) -> Option<u32> {
+        self.links
+            .iter()
+            .find(|(range, _)| pos >= range.start && pos < range.start + range.length)
+            .map(|(_, id)| *id)
+    }
+    pub fn with_links(spans: &[Span<'_>], links: &mut Vec<String>) -> Self {
         let mut text = Vec::new();
         let mut ranges = Vec::with_capacity(spans.len());
+        let mut link_ranges = Vec::new();
         for span in spans {
             let start = text.len() as u32;
             text.extend(span.text.encode_utf16());
-            ranges.push((
-                TextRange {
-                    start,
-                    length: text.len() as u32 - start,
-                },
-                span.style.0,
-            ));
+            let length = text.len() as u32 - start;
+            let range = TextRange { start, length };
+            ranges.push((range, span.style.0));
+            if let Some(href) = &span.href {
+                if length > 0 {
+                    let id = links.len() as u32;
+                    links.push(href.as_ref().to_owned());
+                    link_ranges.push((range, id));
+                }
+            }
         }
         let rtl = crate::text::right_to_left(&text);
         Self {
             text: text.into_boxed_slice(),
             ranges,
+            links: link_ranges,
             rtl,
         }
+    }
+    #[cfg(test)]
+    pub fn new(spans: &[Span<'_>]) -> Self {
+        let mut unused = Vec::new();
+        Self::with_links(spans, &mut unused)
     }
 }
 struct CachedLayout {
@@ -339,6 +443,55 @@ struct CachedLayout {
     bold: bool,
     layout: Rc<Layout>,
 }
+// Static null-terminated UTF-16 literals avoid heap allocations in DirectWrite hot paths.
+const SEGOE_UI: &[u16] = &[
+    b'S' as u16,
+    b'e' as u16,
+    b'g' as u16,
+    b'o' as u16,
+    b'e' as u16,
+    b' ' as u16,
+    b'U' as u16,
+    b'I' as u16,
+    0,
+];
+const SEGOE_UI_EMOJI: &[u16] = &[
+    b'S' as u16,
+    b'e' as u16,
+    b'g' as u16,
+    b'o' as u16,
+    b'e' as u16,
+    b' ' as u16,
+    b'U' as u16,
+    b'I' as u16,
+    b' ' as u16,
+    b'E' as u16,
+    b'm' as u16,
+    b'o' as u16,
+    b'j' as u16,
+    b'i' as u16,
+    0,
+];
+const CONSOLAS: &[u16] = &[
+    b'C' as u16,
+    b'o' as u16,
+    b'n' as u16,
+    b's' as u16,
+    b'o' as u16,
+    b'l' as u16,
+    b'a' as u16,
+    b's' as u16,
+    0,
+];
+const EN_US: &[u16] = &[
+    b'e' as u16,
+    b'n' as u16,
+    b'-' as u16,
+    b'u' as u16,
+    b's' as u16,
+    0,
+];
+
 pub struct Engine {
     factory: Com,
     target: Com,
@@ -347,7 +500,9 @@ pub struct Engine {
     rich: VecDeque<CachedLayout>,
     effects: [Com; 2],
     formats: Vec<(i32, Com)>,
+    para_formats: Vec<(i32, bool, bool, Com)>,
     d2d: Option<Direct2D>,
+    d2d_tried: bool,
 }
 impl Engine {
     pub unsafe fn new() -> Result<Self, i32> {
@@ -390,8 +545,20 @@ impl Engine {
             rich: VecDeque::new(),
             effects: [effect(Style::CODE), effect(Style::LINK)],
             formats: vec![],
-            d2d: direct2d(),
+            para_formats: vec![],
+            // Direct2D is initialized lazily on the first complex-script draw, so
+            // emoji-only documents never pay to load d2d1.dll at startup or layout.
+            d2d: None,
+            d2d_tried: false,
         })
+    }
+    /// Initialize Direct2D on first need and report whether it is available.
+    unsafe fn ensure_d2d(&mut self) -> bool {
+        if !self.d2d_tried {
+            self.d2d_tried = true;
+            self.d2d = direct2d();
+        }
+        self.d2d.is_some()
     }
     pub fn clear_paragraphs(&mut self) {
         self.rich.clear();
@@ -404,6 +571,15 @@ impl Engine {
         width: i32,
         bold: bool,
     ) -> Result<Rc<Layout>, i32> {
+        if let Some(back) = self.rich.back() {
+            if Rc::ptr_eq(&back.text, text)
+                && back.pixels == pixels
+                && back.width == width
+                && back.bold == bold
+            {
+                return Ok(back.layout.clone());
+            }
+        }
         if let Some(at) = self.rich.iter().position(|entry| {
             Rc::ptr_eq(&entry.text, text)
                 && entry.pixels == pixels
@@ -415,35 +591,47 @@ impl Engine {
             self.rich.push_back(entry);
             return Ok(layout);
         }
+        let fmt_idx = if let Some(idx) = self
+            .para_formats
+            .iter()
+            .position(|&(p, b, r, _)| p == pixels && b == bold && r == text.rtl)
+        {
+            idx
+        } else {
+            let mut raw = NULL;
+            let hr = call!(self.factory.0, 15, (SEGOE_UI.as_ptr() => *const u16, NULL => Handle,
+                if bold {700} else {400} => u32, 0 => u32, 5 => u32, pixels as f32 => f32,
+                EN_US.as_ptr() => *const u16, &mut raw => *mut Handle) -> i32);
+            let format = checked(hr, raw)?;
+            if text.rtl {
+                ok(call!(format.0, 6, (1u32 => u32) -> i32))?;
+            }
+            self.para_formats.push((pixels, bold, text.rtl, format));
+            self.para_formats.len() - 1
+        };
         let mut raw = NULL;
-        let hr = call!(self.factory.0, 15, (wide("Segoe UI").as_ptr() => *const u16, NULL => Handle,
-            if bold {700} else {400} => u32, 0 => u32, 5 => u32, pixels as f32 => f32,
-            wide("en-us").as_ptr() => *const u16, &mut raw => *mut Handle) -> i32);
-        let format = checked(hr, raw)?;
-        ok(call!(format.0, 6, (text.rtl as u32 => u32) -> i32))?;
         let hr = call!(self.factory.0, 18, (text.text.as_ptr() => *const u16, text.text.len() as u32 => u32,
-            format.0 => Handle, width.max(1) as f32 => f32, 1.0e9 => f32, &mut raw => *mut Handle) -> i32);
+            self.para_formats[fmt_idx].3.0 => Handle, width.max(1) as f32 => f32, 1.0e9 => f32, &mut raw => *mut Handle) -> i32);
         let object = checked(hr, raw)?;
         for &(range, style) in &text.ranges {
-            if range.length == 0 {
+            if range.length == 0 || style == 0 {
                 continue;
             }
-            let weight = if bold || style & Style::BOLD != 0 {
-                700
-            } else {
-                400
-            };
-            for (slot, value) in [
-                (32, weight),
-                (33, if style & Style::ITALIC != 0 { 2 } else { 0 }),
-                (36, (style & Style::LINK != 0) as u32),
-                (37, (style & Style::STRIKE != 0) as u32),
-            ] {
-                ok(call!(object.0, slot, (value => u32, range => TextRange) -> i32))?;
+            if !bold && style & Style::BOLD != 0 {
+                ok(call!(object.0, 32, (700u32 => u32, range => TextRange) -> i32))?;
+            }
+            if style & Style::ITALIC != 0 {
+                ok(call!(object.0, 33, (2u32 => u32, range => TextRange) -> i32))?;
+            }
+            if style & Style::LINK != 0 {
+                ok(call!(object.0, 36, (1u32 => u32, range => TextRange) -> i32))?;
+            }
+            if style & Style::STRIKE != 0 {
+                ok(call!(object.0, 37, (1u32 => u32, range => TextRange) -> i32))?;
             }
             if style & Style::CODE != 0 {
                 ok(
-                    call!(object.0, 31, (wide("Consolas").as_ptr() => *const u16, range => TextRange) -> i32),
+                    call!(object.0, 31, (CONSOLAS.as_ptr() => *const u16, range => TextRange) -> i32),
                 )?;
             }
             let effect = if style & Style::CODE != 0 {
@@ -479,11 +667,10 @@ impl Engine {
         Ok(layout)
     }
 
-    /// Draw the visible slice of a paragraph at `x`, `y` in `dc` coordinates.
-    /// Direct2D renders straight into the device context; without it a tiled
-    /// DirectWrite bitmap target keeps the same output on legacy systems.
+    /// Draw the visible slice of a paragraph at `x`, `y` in `dc` coordinates,
+    /// optionally highlighting a UTF-16 `selection` range behind the glyphs.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn draw_paragraph(
+    pub unsafe fn draw_paragraph_selected(
         &mut self,
         layout: &Layout,
         dc: Hdc,
@@ -493,6 +680,7 @@ impl Engine {
         palette: Palette,
         foreground: u32,
         background: u32,
+        selection: Option<(u32, u32)>,
     ) -> bool {
         let area = Rect {
             left: (x - 2).max(clip.left),
@@ -509,16 +697,35 @@ impl Engine {
         let renderer = &*(self.renderer.0 as *const Renderer);
         renderer.foreground.set(foreground);
         renderer.palette.set(palette);
-        if self.d2d.is_some() {
-            if self.draw_direct2d(layout, dc, x, y, area, background) {
+        if self.ensure_d2d() {
+            if self.draw_direct2d(layout, dc, x, y, area, background, palette, selection) {
                 return true;
             }
             // A lost device is not fatal: drop it and keep drawing through GDI.
             self.d2d = None;
         }
-        self.draw_bitmap(layout, dc, x, y, area)
+        self.draw_bitmap(layout, dc, x, y, area, palette, selection)
     }
 
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn draw_paragraph(
+        &mut self,
+        layout: &Layout,
+        dc: Hdc,
+        x: i32,
+        y: i32,
+        clip: Rect,
+        palette: Palette,
+        foreground: u32,
+        background: u32,
+    ) -> bool {
+        self.draw_paragraph_selected(
+            layout, dc, x, y, clip, palette, foreground, background, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     unsafe fn draw_direct2d(
         &mut self,
         layout: &Layout,
@@ -527,6 +734,8 @@ impl Engine {
         y: i32,
         area: Rect,
         background: u32,
+        palette: Palette,
+        selection: Option<(u32, u32)>,
     ) -> bool {
         let Some(d2d) = &self.d2d else { return false };
         let renderer = &*(self.renderer.0 as *const Renderer);
@@ -537,6 +746,24 @@ impl Engine {
         // BindDC does not import the device context's pixels, so the row's own
         // background is restored before the glyphs go down.
         call!(d2d.target.0, 47, (&ColorF::new(background) => *const ColorF) -> ());
+        if let Some((start, end)) = selection.filter(|(s, e)| e > s) {
+            let rects = layout.hit_test_range(
+                start,
+                end - start,
+                (x - area.left) as f32,
+                (y - area.top) as f32,
+            );
+            call!(d2d.brush.0, 8, (&ColorF::new(palette.selection()) => *const ColorF) -> ());
+            for m in rects {
+                let rect = RectF {
+                    left: m.left.floor(),
+                    top: m.top.floor(),
+                    right: (m.left + m.width).ceil(),
+                    bottom: (m.top + m.height).ceil(),
+                };
+                call!(d2d.target.0, 17, (&rect => *const RectF, d2d.brush.0 => Handle) -> ());
+            }
+        }
         renderer.d2d.set(d2d.target.0);
         renderer.brush.set(d2d.brush.0);
         let hr = call!(layout.object.0, 58, (ptr::null_mut() => *mut c_void, self.renderer.0 => Handle,
@@ -549,7 +776,17 @@ impl Engine {
 
     // Rasterize only the visible portion. A long paragraph must never allocate a
     // document-height bitmap. Tiles also cap temporary bitmap height at 512px.
-    unsafe fn draw_bitmap(&mut self, layout: &Layout, dc: Hdc, x: i32, y: i32, area: Rect) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_bitmap(
+        &mut self,
+        layout: &Layout,
+        dc: Hdc,
+        x: i32,
+        y: i32,
+        area: Rect,
+        palette: Palette,
+        selection: Option<(u32, u32)>,
+    ) -> bool {
         let (left, right) = (area.left, area.right);
         let mut top = area.top;
         while top < area.bottom {
@@ -569,6 +806,22 @@ impl Engine {
             if BitBlt(memory, 0, 0, width, height, dc, left, top, 0x00cc0020) == 0 {
                 return false;
             }
+            if let Some((start, end)) = selection.filter(|(s, e)| e > s) {
+                for m in
+                    layout.hit_test_range(start, end - start, (x - left) as f32, (y - top) as f32)
+                {
+                    rectangle(
+                        memory,
+                        Rect {
+                            left: m.left.floor() as i32,
+                            top: m.top.floor() as i32,
+                            right: (m.left + m.width).ceil() as i32,
+                            bottom: (m.top + m.height).ceil() as i32,
+                        },
+                        palette.selection(),
+                    );
+                }
+            }
             let hr = call!(layout.object.0, 58, (ptr::null_mut() => *mut c_void, self.renderer.0 => Handle,
                 (x - left) as f32 => f32, (y - top) as f32 => f32) -> i32);
             if hr < 0 || BitBlt(dc, left, top, width, height, memory, 0, 0, 0x00cc0020) == 0 {
@@ -585,8 +838,8 @@ impl Engine {
             index
         } else {
             let mut raw = NULL;
-            let hr = call!(self.factory.0, 15, (wide("Segoe UI Emoji").as_ptr() => *const u16, NULL => Handle,
-                400 => u32, 0 => u32, 5 => u32, pixels as f32 => f32, wide("en-us").as_ptr() => *const u16, &mut raw => *mut Handle) -> i32);
+            let hr = call!(self.factory.0, 15, (SEGOE_UI_EMOJI.as_ptr() => *const u16, NULL => Handle,
+                400 => u32, 0 => u32, 5 => u32, pixels as f32 => f32, EN_US.as_ptr() => *const u16, &mut raw => *mut Handle) -> i32);
             let format = checked(hr, raw)?;
             call!(format.0, 5, (1 => u32) -> i32); // No wrap: a cluster is indivisible.
             self.formats.push((pixels, format));
@@ -1004,7 +1257,7 @@ mod tests {
             let surface = Buffer::new(NULL, 600, 256).expect("an off-screen surface");
             let dc = surface.dc;
             let mut engine = Engine::new().unwrap();
-            let direct2d = engine.d2d.as_ref().map(|_| ());
+            let direct2d = engine.ensure_d2d();
             let text = Rc::new(RichText::new(&crate::markdown::inline(
                 &"العَرَبِيَّةُ **نص** हिन्दी café 😀 `code` [رابط](url) ~~gone~~ ".repeat(200),
             )));
@@ -1086,7 +1339,7 @@ mod tests {
                 }
                 assert!(engine.capacity.0 <= 600 && engine.capacity.1 <= 512);
                 assert!(
-                    direct2d.is_none() || engine.d2d.is_some(),
+                    !direct2d || engine.d2d.is_some(),
                     "Direct2D must keep rendering once it is available"
                 );
             }
@@ -1171,9 +1424,13 @@ mod tests {
     #[test]
     fn direct2d_is_the_pipeline_that_actually_draws() {
         unsafe {
-            let engine = Engine::new().unwrap();
+            let mut engine = Engine::new().unwrap();
             assert!(
-                engine.d2d.is_some(),
+                engine.d2d.is_none(),
+                "Direct2D should initialize lazily, not eagerly at startup"
+            );
+            assert!(
+                engine.ensure_d2d() && engine.d2d.is_some(),
                 "Direct2D device-context target must be available on this system"
             );
         }
@@ -1202,6 +1459,48 @@ mod tests {
             assert_eq!(engine.rich.len(), 64);
             engine.clear_paragraphs();
             assert!(engine.rich.is_empty());
+        }
+    }
+    #[test]
+    fn hit_testing_and_selection_highlight_work_on_shaped_paragraphs() {
+        unsafe {
+            let surface = Buffer::new(NULL, 500, 120).expect("an off-screen surface");
+            let mut engine = Engine::new().unwrap();
+            let mut links = Vec::new();
+            let rich = Rc::new(RichText::with_links(
+                &crate::markdown::inline("العربية [رابط](https://example.test) text"),
+                &mut links,
+            ));
+            assert_eq!(links, ["https://example.test"]);
+            let layout = engine.paragraph(&rich, 18, 460, false).unwrap();
+            let rects = layout.hit_test_range(0, 7, 10.0, 10.0);
+            assert!(!rects.is_empty(), "selection range must produce hit rects");
+            let (pos, _) = layout.hit_test_point(rects[0].left + 2.0, rects[0].top + 2.0);
+            assert!((pos as usize) <= rich.text.len());
+            let palette = Palette::dark();
+            let full = Rect {
+                left: 0,
+                top: 0,
+                right: 500,
+                bottom: 120,
+            };
+            rectangle(surface.dc, full, palette.background);
+            assert!(engine.draw_paragraph_selected(
+                &layout,
+                surface.dc,
+                10,
+                10,
+                full,
+                palette,
+                palette.foreground,
+                palette.background,
+                Some((0, 7)),
+            ));
+            let sel = crate::theme::rgb(palette.selection());
+            assert!(
+                surface.pixels().iter().any(|&p| p & 0xffffff == sel),
+                "selection highlight pixels must be painted behind shaped text"
+            );
         }
     }
 }

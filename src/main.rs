@@ -2,12 +2,14 @@
 
 #[cfg(target_os = "windows")]
 mod association;
+mod clipboard;
 #[cfg(target_os = "windows")]
 mod config;
 #[cfg(target_os = "windows")]
 mod dwrite;
 #[cfg(target_os = "windows")]
 mod instance;
+mod links;
 mod markdown;
 #[cfg(target_os = "windows")]
 mod render;
